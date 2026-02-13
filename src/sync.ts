@@ -251,10 +251,12 @@ export class SyncService {
                         note.content = note.content ? await decryptText(note.content, this.encryptionKey) : "";
                     } catch (err) {
                         console.warn(`[Satset Sync] Decrypt failed for ${note.id}:`, err);
+                        note.title = `Decryption Failed ${note.id.substring(0, 8)}`;
+                        note.content = `> [!ERROR] Decryption Failed\n> Could not decrypt this note. It might use a different key or be corrupted.\n\nRaw content length: ${note.content?.length ?? 0}`;
                         decryptFailed++;
-                        continue;
                     }
                 } else if (note.encrypted && !this.encryptionKey) {
+                    // Skip if we can't decrypt at all (no key derived)
                     skipped++;
                     continue;
                 }
@@ -278,7 +280,7 @@ export class SyncService {
             if (updated > 0) parts.push(`${updated} updated`);
             if (renamed > 0) parts.push(`${renamed} renamed`);
             if (skipped > 0) parts.push(`${skipped} skipped`);
-            if (decryptFailed > 0) parts.push(`${decryptFailed} decrypt failed`);
+            if (decryptFailed > 0) parts.push(`${decryptFailed} errors`);
 
             new Notice(`✅ Sync complete: ${parts.join(", ") || "no changes"}`);
         } catch (error: any) {
@@ -291,17 +293,16 @@ export class SyncService {
      * Smart Sync write logic:
      * 1. Check ID index for existing file with same satset_id.
      * 2. If found: compare updated_at, skip if unchanged, update if changed, rename if title changed.
-     * 3. If not found: create new file.
+     * 3. If not found: find a UNIQUE filename (handle collisions) and create.
      */
     private async writeNoteSmartSync(
         note: SatsetNote, folderPath: string
     ): Promise<"created" | "updated" | "renamed" | "skipped"> {
         const vault: Vault = this.plugin.app.vault;
         const title = this.sanitizeFilename(note.title || "Untitled");
-        const targetPath = normalizePath(`${folderPath}/${title}.md`);
         const content = this.noteToMarkdown(note);
 
-        // Step 1: Check if a file with this satset_id already exists
+        // Step 1: Check if a file with this satset_id already exists (mapped by previous syncs)
         const existingPath = this.idToFileMap.get(note.id);
 
         if (existingPath) {
@@ -315,16 +316,26 @@ export class SyncService {
                     return "skipped";
                 }
 
-                // Check if the title (filename) has changed
+                // Determine target path (handling renames if title changed)
+                // We want to keep the SAME filename if title matches, or rename if it changed.
+                // If renaming, we must ensure the NEW name doesn't collide.
+                // But wait, if we are just updating, we usually keep the filename unless we force rename on title change.
+                // Let's stick to: Rename if title changed.
+
+                // Construct ideal path from current title
+                let targetPath = normalizePath(`${folderPath}/${title}.md`);
+
+                // Only rename if the path implies a title change
                 if (existingFile.path !== targetPath) {
-                    // Rename the file and update content
+                    // Ensure targetPath is unique (could match another note's title)
+                    targetPath = await this.getUniquePath(targetPath, note.id);
+
                     try {
                         await vault.rename(existingFile, targetPath);
                         const renamedFile = vault.getAbstractFileByPath(targetPath);
                         if (renamedFile instanceof TFile) {
                             await vault.modify(renamedFile, content);
                         }
-                        // Update index
                         this.idToFileMap.set(note.id, targetPath);
                         return "renamed";
                     } catch (err) {
@@ -340,23 +351,72 @@ export class SyncService {
             }
         }
 
-        // Step 2: No existing file by ID — check if target path already exists (e.g. manually created)
-        const fileAtTarget = vault.getAbstractFileByPath(targetPath);
-        if (fileAtTarget instanceof TFile) {
-            const existingContent = await vault.read(fileAtTarget);
-            const existingUpdatedAt = this.extractFrontmatterValue(existingContent, "updated_at");
-            if (existingUpdatedAt && existingUpdatedAt >= note.updated_at) {
-                return "skipped";
-            }
-            await vault.modify(fileAtTarget, content);
-            this.idToFileMap.set(note.id, targetPath);
-            return "updated";
-        }
+        // Step 2: New file (or not found in index)
+        // Ensure we don't overwrite an existing file that belongs to a different ID (collision)
+        let targetPath = normalizePath(`${folderPath}/${title}.md`);
+        targetPath = await this.getUniquePath(targetPath, note.id);
 
-        // Step 3: Create new file
         await vault.create(targetPath, content);
         this.idToFileMap.set(note.id, targetPath);
         return "created";
+    }
+
+    /**
+     * Generates a unique file path by appending (1), (2), etc. if the path exists
+     * and belongs to a different note (or is unmanaged).
+     */
+    private async getUniquePath(basePath: string, noteId: string): Promise<string> {
+        const vault: Vault = this.plugin.app.vault;
+        let candidatePath = basePath;
+        let counter = 1;
+
+        while (true) {
+            const file = vault.getAbstractFileByPath(candidatePath);
+            if (!file) {
+                // Path is free!
+                return candidatePath;
+            }
+
+            // File exists. Does it belong to THIS note?
+            if (file instanceof TFile) {
+                // Check in-memory map first (fastest)
+                // If this file path is mapped to OUR noteId, then it's ours.
+                // iterate map? No, map is id -> path.
+                // We want path -> id.
+
+                // Let's check if the file content has our ID.
+                // Optimization: Check if the file path matches what we *expect* for this ID? 
+                // No, we are deciding the path.
+
+                // If the existing file has our ID, then we can overwrite it (it's the same note).
+                // BUT, `writeNoteSmartSync` Step 1 handles "Known existing file".
+                // We only call this when:
+                // A) We are creating a NEW note (Step 2) -> We shouldn't overwrite anything unless it's a ghost.
+                // B) We are RENAMING a note (Step 1) -> We shouldn't overwrite another note.
+
+                // So, if file exists, we MUST check its ID.
+                try {
+                    const content = await vault.cachedRead(file);
+                    const existingId = this.extractFrontmatterValue(content, "satset_id");
+
+                    if (existingId === noteId) {
+                        // It's us! (Maybe map was out of sync, or we are renaming to same name?)
+                        return candidatePath;
+                    }
+                } catch {
+                    // Can't read? Treat as taken.
+                }
+            }
+
+            // Collision! Append counter.
+            // strip extension
+            const extIndex = basePath.lastIndexOf(".");
+            const base = extIndex > -1 ? basePath.substring(0, extIndex) : basePath;
+            const ext = extIndex > -1 ? basePath.substring(extIndex) : "";
+
+            candidatePath = `${base} (${counter})${ext}`;
+            counter++;
+        }
     }
 
     private noteToMarkdown(note: SatsetNote): string {
