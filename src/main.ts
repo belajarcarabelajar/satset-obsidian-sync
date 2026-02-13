@@ -65,7 +65,7 @@ export default class SatsetSyncPlugin extends Plugin {
         this.stopAutoSync();
 
         const minutes = this.settings.syncIntervalMinutes;
-        if (minutes <= 0 || !this.settings.accessToken) return;
+        if (minutes <= 0 || !this.settings.apiKey) return;
 
         const ms = minutes * 60 * 1000;
         this.autoSyncInterval = window.setInterval(async () => {

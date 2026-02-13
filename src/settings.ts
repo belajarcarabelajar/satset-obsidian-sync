@@ -2,6 +2,7 @@
  * Satset Sync - Settings
  *
  * Defines the plugin settings interface and the Settings Tab UI.
+ * Uses API Key authentication instead of Email/Password for security.
  */
 import { App, PluginSettingTab, Setting, Notice } from "obsidian";
 import type SatsetSyncPlugin from "./main";
@@ -10,20 +11,14 @@ export interface SatsetSyncSettings {
     /** Supabase Project URL */
     supabaseUrl: string;
 
-    /** Supabase Anon Public Key */
-    supabaseKey: string;
+    /** API Key for sync-notes authentication */
+    apiKey: string;
 
-    /** User Email (for login) */
-    email: string;
-
-    /** Saved Access Token (JWT) */
-    accessToken: string;
-
-    /** Saved Refresh Token */
-    refreshToken: string;
-
-    /** User ID (for encryption key derivation) */
+    /** User ID (resolved from API Key) */
     userId: string;
+
+    /** User Email (resolved from API Key) */
+    email: string;
 
     /** Folder inside the vault where synced notes are stored */
     syncFolder: string;
@@ -40,11 +35,9 @@ export interface SatsetSyncSettings {
 
 export const DEFAULT_SETTINGS: SatsetSyncSettings = {
     supabaseUrl: "https://ixvbsexujxdbbvzvmybj.supabase.co",
-    supabaseKey: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Iml4dmJzZXh1anhkYmJ2enZteWJqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDk5Mzg4MDAsImV4cCI6MjA2NTUxNDgwMH0.CYpokPpeceFYzh9gMh-ymGYte9iCWcNamCCIc56Fh1I",
-    email: "",
-    accessToken: "",
-    refreshToken: "",
+    apiKey: "",
     userId: "",
+    email: "",
     syncFolder: "Satset",
     syncIntervalMinutes: 5,
     lastSyncTime: "",
@@ -53,7 +46,6 @@ export const DEFAULT_SETTINGS: SatsetSyncSettings = {
 
 export class SatsetSyncSettingTab extends PluginSettingTab {
     plugin: SatsetSyncPlugin;
-    passwordInput: string = ""; // Temporary storage for password input
 
     constructor(app: App, plugin: SatsetSyncPlugin) {
         super(app, plugin);
@@ -69,73 +61,74 @@ export class SatsetSyncSettingTab extends PluginSettingTab {
         // --- Authentication Section ---
         containerEl.createEl("h3", { text: "Authentication" });
 
-        const isLoggedIn = !!this.plugin.settings.accessToken;
+        const isConnected = !!this.plugin.settings.apiKey && !!this.plugin.settings.userId;
 
-        if (isLoggedIn) {
+        if (isConnected) {
             const statusDiv = containerEl.createDiv({ cls: "satset-status-box" });
             statusDiv.createEl("p", {
-                text: `✅ Logged in as ${this.plugin.settings.email}`,
-                style: "color: var(--text-success); font-weight: bold;"
+                text: `✅ Connected as ${this.plugin.settings.email}`,
+                attr: { style: "color: var(--text-success); font-weight: bold;" }
             });
 
             new Setting(containerEl)
-                .setName("Logout")
-                .setDesc("Sign out and clear stored tokens.")
+                .setName("Disconnect")
+                .setDesc("Remove API Key and clear stored data.")
                 .addButton((button: any) =>
                     button
-                        .setButtonText("Logout")
+                        .setButtonText("Disconnect")
                         .setWarning()
                         .onClick(async () => {
-                            await this.plugin.syncService.logout();
-                            this.display(); // Refresh UI
+                            await this.plugin.syncService.disconnect();
+                            this.display();
                         })
                 );
         } else {
-            // Login form — Supabase URL and Key are pre-configured
             new Setting(containerEl)
-                .setName("Email")
-                .setDesc("Your Satset account email")
+                .setName("Supabase Project URL")
+                .setDesc("Your Supabase Project URL")
                 .addText((text: any) =>
                     text
-                        .setPlaceholder("email@example.com")
-                        .setValue(this.plugin.settings.email)
+                        .setPlaceholder("https://your-project.supabase.co")
+                        .setValue(this.plugin.settings.supabaseUrl)
                         .onChange(async (value: string) => {
-                            this.plugin.settings.email = value.trim();
+                            this.plugin.settings.supabaseUrl = value.trim();
                             await this.plugin.saveSettings();
                         })
                 );
 
             new Setting(containerEl)
-                .setName("Password")
-                .setDesc("Your Satset account password")
+                .setName("API Key")
+                .setDesc("Generate an API Key from the Satset website (Integrations page).")
                 .addText((text: any) => {
                     text.inputEl.type = "password";
+                    text.inputEl.style.width = "100%";
                     text
-                        .setPlaceholder("Password")
-                        .setValue(this.passwordInput)
-                        .onChange((value: string) => {
-                            this.passwordInput = value;
+                        .setPlaceholder("satset_sk_...")
+                        .setValue(this.plugin.settings.apiKey)
+                        .onChange(async (value: string) => {
+                            this.plugin.settings.apiKey = value.trim();
+                            await this.plugin.saveSettings();
                         });
                 });
 
             new Setting(containerEl)
-                .setName("Login")
+                .setName("Connect")
                 .addButton((button: any) =>
                     button
-                        .setButtonText("Login")
+                        .setButtonText("Connect")
                         .setCta()
                         .onClick(async () => {
-                            button.setButtonText("Logging in...");
+                            if (!this.plugin.settings.apiKey) {
+                                new Notice("❌ Please enter an API Key first.");
+                                return;
+                            }
+                            button.setButtonText("Connecting...");
                             button.setDisabled(true);
-                            const success = await this.plugin.syncService.login(
-                                this.plugin.settings.email,
-                                this.passwordInput
-                            );
+                            const success = await this.plugin.syncService.connect();
                             if (success) {
-                                this.passwordInput = ""; // Clear password from memory
-                                this.display(); // Refresh UI to show logged-in state
+                                this.display();
                             } else {
-                                button.setButtonText("Login Failed");
+                                button.setButtonText("Connect");
                                 button.setDisabled(false);
                             }
                         })
@@ -213,7 +206,7 @@ export class SatsetSyncSettingTab extends PluginSettingTab {
             .addButton((button: any) =>
                 button
                     .setButtonText("Sync Now")
-                    .setDisabled(!isLoggedIn)
+                    .setDisabled(!isConnected)
                     .onClick(async () => {
                         button.setButtonText("Syncing...");
                         button.setDisabled(true);

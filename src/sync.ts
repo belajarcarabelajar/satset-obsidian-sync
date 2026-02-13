@@ -1,11 +1,13 @@
 /**
  * Satset Sync - Sync Service
  *
- * Handles communication directly with Supabase via REST API
- * (Auth + PostgREST) and writing/updating Markdown files.
- * Includes AES-GCM decryption for encrypted notes.
+ * Handles communication with the Satset sync-notes Edge Function via API Key,
+ * writing/updating Markdown files in Obsidian, and AES-GCM decryption.
+ * 
+ * Smart Sync: Uses satset_id in frontmatter to prevent duplicates,
+ * handles renames, and supports incremental sync.
  */
-import { Notice, Vault, TFile, normalizePath, requestUrl } from "obsidian";
+import { Notice, Vault, TFile, TFolder, normalizePath, requestUrl } from "obsidian";
 import type SatsetSyncPlugin from "./main";
 
 // ── Encryption Constants (must match Satset web app) ──
@@ -27,11 +29,10 @@ interface SatsetNote {
     timestamp: number;
 }
 
-interface AuthResponse {
-    access_token: string;
-    refresh_token: string;
-    user: { id: string; email: string };
-    expires_in: number;
+interface ConfigResponse {
+    userId: string;
+    email: string;
+    encryptionSalt: string | null;
 }
 
 // ── Crypto Helpers ──
@@ -84,271 +85,278 @@ export class SyncService {
     private plugin: SatsetSyncPlugin;
     private encryptionKey: CryptoKey | null = null;
 
+    // In-memory index: satset_id -> file path (built on each sync)
+    private idToFileMap: Map<string, string> = new Map();
+
     constructor(plugin: SatsetSyncPlugin) {
         this.plugin = plugin;
     }
 
-    /** Parse JWT payload to extract userId and email (fallback). */
-    private parseJwt(token: string): { sub: string; email: string } | null {
-        try {
-            const payload = JSON.parse(atob(token.split(".")[1]));
-            return { sub: payload.sub || "", email: payload.email || "" };
-        } catch (e) {
-            return null;
-        }
-    }
-
-    /** Ensure userId/email are in settings (recover from JWT if needed). */
-    private async ensureUserInfo(): Promise<{ userId: string; email: string } | null> {
-        let { userId, email, accessToken } = this.plugin.settings;
-        if (userId && email) return { userId, email };
-
-        // Fallback: extract from JWT
-        if (accessToken) {
-            const jwt = this.parseJwt(accessToken);
-            if (jwt && jwt.sub) {
-                userId = jwt.sub;
-                email = email || jwt.email;
-                this.plugin.settings.userId = userId;
-                this.plugin.settings.email = email;
-                await this.plugin.saveSettings();
-                console.log(`[Satset Sync] Recovered userId from JWT: ${userId}`);
-                return { userId, email };
-            }
-        }
-        return null;
-    }
-
-    /** HTTP request helper. */
-    private async request(endpoint: string, options: any): Promise<any> {
-        const { supabaseUrl } = this.plugin.settings;
+    /** HTTP request to the sync-notes Edge Function. */
+    private async request(path: string, options: any = {}): Promise<any> {
+        const { supabaseUrl, apiKey } = this.plugin.settings;
         if (!supabaseUrl) throw new Error("Supabase URL not configured.");
+        if (!apiKey) throw new Error("API Key not configured.");
 
-        const url = `${supabaseUrl}${endpoint}`;
+        const url = `${supabaseUrl}/functions/v1/sync-notes${path}`;
         const response = await requestUrl({
             url,
             ...options,
-            headers: { "Content-Type": "application/json", ...options.headers },
+            headers: {
+                "Content-Type": "application/json",
+                "x-api-key": apiKey,
+                ...options.headers,
+            },
         });
 
         if (response.status >= 200 && response.status < 300) {
             return response.json;
         }
+
+        // Handle specific error codes
+        if (response.status === 401) {
+            throw new Error("Invalid or expired API Key. Please reconnect.");
+        }
+        if (response.status === 403) {
+            throw new Error("API Key has been revoked. Generate a new one from the website.");
+        }
         throw new Error(`HTTP ${response.status}: ${JSON.stringify(response.json)}`);
     }
 
-    /** Login with email/password. Derives encryption key afterwards. */
-    async login(email: string, password: string): Promise<boolean> {
-        const { supabaseUrl, supabaseKey } = this.plugin.settings;
-        if (!supabaseUrl || !supabaseKey) {
-            new Notice("❌ Configure Supabase URL and Key first.");
-            return false;
-        }
-
+    /** Connect using API Key: fetch config and derive encryption key. */
+    async connect(): Promise<boolean> {
         try {
-            const data: AuthResponse = await this.request("/auth/v1/token?grant_type=password", {
-                method: "POST",
-                headers: { apikey: supabaseKey },
-                body: JSON.stringify({ email, password }),
-            });
+            const config: ConfigResponse = await this.request("/config", { method: "GET" });
 
-            this.plugin.settings.accessToken = data.access_token;
-            this.plugin.settings.refreshToken = data.refresh_token;
-            this.plugin.settings.email = data.user.email;
-            this.plugin.settings.userId = data.user.id;
+            this.plugin.settings.userId = config.userId;
+            this.plugin.settings.email = config.email;
             await this.plugin.saveSettings();
 
-            await this.initEncryptionKey(data.access_token, data.user.id, data.user.email);
+            // Derive encryption key if salt is available
+            if (config.encryptionSalt) {
+                const salt = new Uint8Array(base64ToArrayBuffer(config.encryptionSalt));
+                const passphrase = `${config.userId}:${config.email}`;
+                this.encryptionKey = await deriveEncryptionKey(passphrase, salt);
+                console.log("[Satset Sync] Encryption key derived ✓");
+            } else {
+                console.warn("[Satset Sync] No encryption salt found. Encrypted notes will be skipped.");
+                new Notice("⚠️ No encryption salt. Encrypted notes will be skipped.");
+                this.encryptionKey = null;
+            }
 
-            new Notice(`✅ Logged in as ${data.user.email}`);
+            new Notice(`✅ Connected as ${config.email}`);
             return true;
         } catch (error: any) {
-            new Notice("❌ Login failed. Check console for details.");
-            console.error("Login error:", error);
+            new Notice(`❌ Connection failed: ${error.message}`);
+            console.error("[Satset Sync] Connection error:", error);
             return false;
         }
     }
 
-    /** Fetch encryption salt from profiles table, derive decryption key. */
-    private async initEncryptionKey(token: string, userId: string, email: string): Promise<void> {
-        const { supabaseKey } = this.plugin.settings;
-        try {
-            const profiles = await this.request(
-                `/rest/v1/profiles?id=eq.${userId}&select=encryption_salt`,
-                {
-                    method: "GET",
-                    headers: { apikey: supabaseKey, Authorization: `Bearer ${token}` },
-                }
-            );
-
-            if (!profiles || profiles.length === 0 || !profiles[0].encryption_salt) {
-                console.warn("[Satset Sync] No encryption salt found.");
-                new Notice("⚠️ No encryption salt found. Encrypted notes will be skipped.");
-                this.encryptionKey = null;
-                return;
-            }
-
-            const salt = new Uint8Array(base64ToArrayBuffer(profiles[0].encryption_salt));
-            const passphrase = `${userId}:${email}`;
-            this.encryptionKey = await deriveEncryptionKey(passphrase, salt);
-            console.log("[Satset Sync] Encryption key derived ✓");
-        } catch (error) {
-            console.error("[Satset Sync] Encryption key derivation failed:", error);
-            new Notice("⚠️ Encryption key failed. Check console.");
-            this.encryptionKey = null;
-        }
-    }
-
-    /** Logout and clear all stored credentials. */
-    async logout(): Promise<void> {
-        this.plugin.settings.accessToken = "";
-        this.plugin.settings.refreshToken = "";
-        this.plugin.settings.email = "";
+    /** Disconnect: clear API Key and user data. */
+    async disconnect(): Promise<void> {
+        this.plugin.settings.apiKey = "";
         this.plugin.settings.userId = "";
+        this.plugin.settings.email = "";
         this.encryptionKey = null;
         await this.plugin.saveSettings();
-        new Notice("👋 Logged out.");
+        new Notice("👋 Disconnected.");
     }
 
-    /** Refresh access token using refresh token. */
-    async refreshSession(): Promise<boolean> {
-        const { supabaseKey, refreshToken } = this.plugin.settings;
-        if (!refreshToken) return false;
+    /** Build an index of satset_id -> filePath by scanning the sync folder. */
+    private async buildIdIndex(syncFolder: string): Promise<void> {
+        this.idToFileMap.clear();
+        const vault: Vault = this.plugin.app.vault;
+        const normalizedFolder = normalizePath(syncFolder);
+        const folder = vault.getAbstractFileByPath(normalizedFolder);
 
-        try {
-            const data: AuthResponse = await this.request("/auth/v1/token?grant_type=refresh_token", {
-                method: "POST",
-                headers: { apikey: supabaseKey },
-                body: JSON.stringify({ refresh_token: refreshToken }),
-            });
-
-            this.plugin.settings.accessToken = data.access_token;
-            this.plugin.settings.refreshToken = data.refresh_token;
-            await this.plugin.saveSettings();
-
-            if (!this.encryptionKey) {
-                const userInfo = await this.ensureUserInfo();
-                if (userInfo) {
-                    await this.initEncryptionKey(data.access_token, userInfo.userId, userInfo.email);
-                }
-            }
-
-            console.log("[Satset Sync] Session refreshed.");
-            return true;
-        } catch (error) {
-            console.error("[Satset Sync] Refresh failed:", error);
-            await this.logout();
-            new Notice("⚠️ Session expired. Please login again.");
-            return false;
+        if (!folder || !(folder instanceof TFolder)) {
+            return; // Folder doesn't exist yet, no files to index
         }
+
+        const files = vault.getMarkdownFiles().filter(f => f.path.startsWith(normalizedFolder + "/"));
+
+        for (const file of files) {
+            try {
+                const content = await vault.cachedRead(file);
+                const satsetId = this.extractFrontmatterValue(content, "satset_id");
+                if (satsetId) {
+                    this.idToFileMap.set(satsetId, file.path);
+                }
+            } catch {
+                // Skip unreadable files
+            }
+        }
+
+        console.log(`[Satset Sync] Indexed ${this.idToFileMap.size} files by satset_id.`);
     }
 
     /** Main sync function. */
     async syncNotes(): Promise<void> {
-        const { supabaseKey, accessToken, syncFolder, lastSyncTime, includeArchived } =
-            this.plugin.settings;
+        const { apiKey, syncFolder, lastSyncTime, includeArchived } = this.plugin.settings;
 
-        if (!accessToken) {
-            new Notice("⚠️ Please login first.");
+        if (!apiKey) {
+            new Notice("⚠️ Please connect with an API Key first.");
             return;
         }
 
-        // Ensure encryption key is ready (after plugin reload or upgrade from old version)
-        if (!this.encryptionKey) {
-            const userInfo = await this.ensureUserInfo();
-            if (userInfo) {
-                await this.initEncryptionKey(accessToken, userInfo.userId, userInfo.email);
+        // Ensure encryption key is ready
+        if (!this.encryptionKey && this.plugin.settings.userId) {
+            try {
+                const config: ConfigResponse = await this.request("/config", { method: "GET" });
+                if (config.encryptionSalt) {
+                    const salt = new Uint8Array(base64ToArrayBuffer(config.encryptionSalt));
+                    const passphrase = `${config.userId}:${config.email}`;
+                    this.encryptionKey = await deriveEncryptionKey(passphrase, salt);
+                }
+            } catch {
+                // Non-fatal; encrypted notes will be skipped
             }
         }
 
         try {
-            let query = "/rest/v1/notes?select=*&order=updated_at.asc";
+            // Build the ID -> file path index
+            await this.buildIdIndex(syncFolder);
+
+            let query = `?include_archived=${includeArchived}`;
             if (lastSyncTime) {
-                query += `&updated_at=gt.${encodeURIComponent(lastSyncTime)}`;
-            }
-            if (!includeArchived) {
-                query += `&archived=is.false`;
+                query += `&since=${encodeURIComponent(lastSyncTime)}`;
             }
 
-            console.log(`[Satset Sync] Requesting: ${query}`);
+            console.log(`[Satset Sync] Fetching notes: ${query}`);
             new Notice("🔄 Syncing notes...");
 
-            try {
-                await this.fetchAndProcessNotes(query, supabaseKey, accessToken, syncFolder);
-            } catch (error: any) {
-                if (error.message && error.message.includes("401")) {
-                    console.log("[Satset Sync] 401, trying refresh...");
-                    const refreshed = await this.refreshSession();
-                    if (refreshed) {
-                        await this.fetchAndProcessNotes(
-                            query, supabaseKey, this.plugin.settings.accessToken, syncFolder
-                        );
+            const result = await this.request(`/${query}`, { method: "GET" });
+            const notes: SatsetNote[] = result.notes || [];
+
+            if (notes.length === 0) {
+                new Notice("✅ Already up to date.");
+                return;
+            }
+
+            await this.ensureFolder(syncFolder);
+
+            let created = 0;
+            let updated = 0;
+            let skipped = 0;
+            let renamed = 0;
+            let decryptFailed = 0;
+            let maxUpdatedAt = lastSyncTime;
+
+            for (const note of notes) {
+                // Decrypt if needed
+                if (note.encrypted && this.encryptionKey) {
+                    try {
+                        note.title = await decryptText(note.title, this.encryptionKey);
+                        note.content = note.content ? await decryptText(note.content, this.encryptionKey) : "";
+                    } catch (err) {
+                        console.warn(`[Satset Sync] Decrypt failed for ${note.id}:`, err);
+                        decryptFailed++;
+                        continue;
                     }
-                } else {
-                    throw error;
+                } else if (note.encrypted && !this.encryptionKey) {
+                    skipped++;
+                    continue;
+                }
+
+                const result = await this.writeNoteSmartSync(note, syncFolder);
+                if (result === "created") created++;
+                else if (result === "updated") updated++;
+                else if (result === "renamed") renamed++;
+                else if (result === "skipped") skipped++;
+
+                if (note.updated_at > maxUpdatedAt) {
+                    maxUpdatedAt = note.updated_at;
                 }
             }
+
+            this.plugin.settings.lastSyncTime = maxUpdatedAt;
+            await this.plugin.saveSettings();
+
+            const parts: string[] = [];
+            if (created > 0) parts.push(`${created} created`);
+            if (updated > 0) parts.push(`${updated} updated`);
+            if (renamed > 0) parts.push(`${renamed} renamed`);
+            if (skipped > 0) parts.push(`${skipped} skipped`);
+            if (decryptFailed > 0) parts.push(`${decryptFailed} decrypt failed`);
+
+            new Notice(`✅ Sync complete: ${parts.join(", ") || "no changes"}`);
         } catch (error: any) {
             console.error("[Satset Sync] Sync error:", error);
             new Notice(`❌ Sync error: ${error.message}`);
         }
     }
 
-    private async fetchAndProcessNotes(
-        endpoint: string, apiKey: string, token: string, syncFolder: string
-    ): Promise<void> {
-        const notes: SatsetNote[] = await this.request(endpoint, {
-            method: "GET",
-            headers: { apikey: apiKey, Authorization: `Bearer ${token}` },
-        });
+    /**
+     * Smart Sync write logic:
+     * 1. Check ID index for existing file with same satset_id.
+     * 2. If found: compare updated_at, skip if unchanged, update if changed, rename if title changed.
+     * 3. If not found: create new file.
+     */
+    private async writeNoteSmartSync(
+        note: SatsetNote, folderPath: string
+    ): Promise<"created" | "updated" | "renamed" | "skipped"> {
+        const vault: Vault = this.plugin.app.vault;
+        const title = this.sanitizeFilename(note.title || "Untitled");
+        const targetPath = normalizePath(`${folderPath}/${title}.md`);
+        const content = this.noteToMarkdown(note);
 
-        if (!notes || notes.length === 0) {
-            new Notice("✅ Already up to date.");
-            return;
-        }
+        // Step 1: Check if a file with this satset_id already exists
+        const existingPath = this.idToFileMap.get(note.id);
 
-        await this.ensureFolder(syncFolder);
+        if (existingPath) {
+            const existingFile = vault.getAbstractFileByPath(existingPath);
+            if (existingFile instanceof TFile) {
+                const existingContent = await vault.read(existingFile);
+                const existingUpdatedAt = this.extractFrontmatterValue(existingContent, "updated_at");
 
-        let created = 0;
-        let updated = 0;
-        let skipped = 0;
-        let decryptFailed = 0;
-        let maxUpdatedAt = this.plugin.settings.lastSyncTime;
-
-        for (const note of notes) {
-            if (note.encrypted && this.encryptionKey) {
-                try {
-                    note.title = await decryptText(note.title, this.encryptionKey);
-                    note.content = note.content ? await decryptText(note.content, this.encryptionKey) : "";
-                } catch (err) {
-                    console.warn(`[Satset Sync] Decrypt failed for ${note.id}:`, err);
-                    decryptFailed++;
-                    continue;
+                // Skip if local file is already up to date
+                if (existingUpdatedAt && existingUpdatedAt >= note.updated_at) {
+                    return "skipped";
                 }
-            } else if (note.encrypted && !this.encryptionKey) {
-                skipped++;
-                continue;
-            }
 
-            const result = await this.writeNote(note, syncFolder);
-            if (result === "created") created++;
-            else if (result === "updated") updated++;
+                // Check if the title (filename) has changed
+                if (existingFile.path !== targetPath) {
+                    // Rename the file and update content
+                    try {
+                        await vault.rename(existingFile, targetPath);
+                        const renamedFile = vault.getAbstractFileByPath(targetPath);
+                        if (renamedFile instanceof TFile) {
+                            await vault.modify(renamedFile, content);
+                        }
+                        // Update index
+                        this.idToFileMap.set(note.id, targetPath);
+                        return "renamed";
+                    } catch (err) {
+                        console.warn(`[Satset Sync] Rename failed for ${note.id}, updating in place:`, err);
+                        await vault.modify(existingFile, content);
+                        return "updated";
+                    }
+                }
 
-            if (note.updated_at > maxUpdatedAt) {
-                maxUpdatedAt = note.updated_at;
+                // Same filename, just update content
+                await vault.modify(existingFile, content);
+                return "updated";
             }
         }
 
-        this.plugin.settings.lastSyncTime = maxUpdatedAt;
-        await this.plugin.saveSettings();
+        // Step 2: No existing file by ID — check if target path already exists (e.g. manually created)
+        const fileAtTarget = vault.getAbstractFileByPath(targetPath);
+        if (fileAtTarget instanceof TFile) {
+            const existingContent = await vault.read(fileAtTarget);
+            const existingUpdatedAt = this.extractFrontmatterValue(existingContent, "updated_at");
+            if (existingUpdatedAt && existingUpdatedAt >= note.updated_at) {
+                return "skipped";
+            }
+            await vault.modify(fileAtTarget, content);
+            this.idToFileMap.set(note.id, targetPath);
+            return "updated";
+        }
 
-        const parts: string[] = [];
-        if (created > 0) parts.push(`${created} created`);
-        if (updated > 0) parts.push(`${updated} updated`);
-        if (skipped > 0) parts.push(`${skipped} skipped (no key)`);
-        if (decryptFailed > 0) parts.push(`${decryptFailed} decrypt failed`);
-
-        new Notice(`✅ Sync complete: ${parts.join(", ") || "no changes"}`);
+        // Step 3: Create new file
+        await vault.create(targetPath, content);
+        this.idToFileMap.set(note.id, targetPath);
+        return "created";
     }
 
     private noteToMarkdown(note: SatsetNote): string {
@@ -377,28 +385,6 @@ export class SyncService {
             .replace(/\s+/g, " ")
             .trim()
             .slice(0, 100) || "Untitled";
-    }
-
-    private async writeNote(note: SatsetNote, folderPath: string): Promise<"created" | "updated" | "skipped"> {
-        const vault: Vault = this.plugin.app.vault;
-        const title = this.sanitizeFilename(note.title || "Untitled");
-        const filePath = normalizePath(`${folderPath}/${title}.md`);
-        const content = this.noteToMarkdown(note);
-
-        const existingFile = vault.getAbstractFileByPath(filePath);
-
-        if (existingFile instanceof TFile) {
-            const existingContent = await vault.read(existingFile);
-            const existingUpdatedAt = this.extractFrontmatterValue(existingContent, "updated_at");
-            if (existingUpdatedAt && existingUpdatedAt >= note.updated_at) {
-                return "skipped";
-            }
-            await vault.modify(existingFile, content);
-            return "updated";
-        } else {
-            await vault.create(filePath, content);
-            return "created";
-        }
     }
 
     private extractFrontmatterValue(content: string, key: string): string | null {
