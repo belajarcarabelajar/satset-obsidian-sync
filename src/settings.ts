@@ -4,7 +4,7 @@
  * Defines the plugin settings interface and the Settings Tab UI.
  * Uses API Key authentication instead of Email/Password for security.
  */
-import { App, PluginSettingTab, Setting, Notice } from "obsidian";
+import { App, PluginSettingTab, Setting, Notice, ButtonComponent, TextComponent } from "obsidian";
 import type SatsetSyncPlugin from "./main";
 
 export interface SatsetSyncSettings {
@@ -52,24 +52,23 @@ export class SatsetSyncSettingTab extends PluginSettingTab {
         const { containerEl } = this;
         containerEl.empty();
 
-        containerEl.createEl("h2", { text: "Satset Sync Settings" });
+        new Setting(containerEl).setName("Satset Sync settings").setHeading();
 
         // --- Authentication Section ---
-        containerEl.createEl("h3", { text: "Authentication" });
+        new Setting(containerEl).setName("Authentication").setHeading();
 
         const isConnected = !!this.plugin.settings.apiKey && !!this.plugin.settings.userId;
 
         if (isConnected) {
-            const statusDiv = containerEl.createDiv({ cls: "satset-status-box" });
+            const statusDiv = containerEl.createDiv({ cls: "satset-status-connected" });
             statusDiv.createEl("p", {
                 text: `✅ Connected as ${this.plugin.settings.email}`,
-                attr: { style: "color: var(--text-success); font-weight: bold;" }
             });
 
             new Setting(containerEl)
                 .setName("Disconnect")
-                .setDesc("Remove API Key and clear stored data.")
-                .addButton((button: any) =>
+                .setDesc("Remove API key and clear stored data.")
+                .addButton((button: ButtonComponent) =>
                     button
                         .setButtonText("Disconnect")
                         .setWarning()
@@ -80,9 +79,9 @@ export class SatsetSyncSettingTab extends PluginSettingTab {
                 );
         } else {
             new Setting(containerEl)
-                .setName("Supabase Project URL")
-                .setDesc("Your Supabase Project URL")
-                .addText((text: any) =>
+                .setName("Supabase project URL")
+                .setDesc("Your Supabase project URL")
+                .addText((text: TextComponent) =>
                     text
                         .setPlaceholder("https://your-project.supabase.co")
                         .setValue(this.plugin.settings.supabaseUrl)
@@ -93,9 +92,9 @@ export class SatsetSyncSettingTab extends PluginSettingTab {
                 );
 
             new Setting(containerEl)
-                .setName("API Key")
-                .setDesc("Generate an API Key from the Satset website (Integrations page).")
-                .addText((text: any) => {
+                .setName("API key")
+                .setDesc("Generate an API key from the Satset website (Integrations page).")
+                .addText((text: TextComponent) => {
                     text.inputEl.type = "password";
                     text.inputEl.style.width = "100%";
                     text
@@ -109,13 +108,13 @@ export class SatsetSyncSettingTab extends PluginSettingTab {
 
             new Setting(containerEl)
                 .setName("Connect")
-                .addButton((button: any) =>
+                .addButton((button: ButtonComponent) =>
                     button
                         .setButtonText("Connect")
                         .setCta()
                         .onClick(async () => {
                             if (!this.plugin.settings.apiKey) {
-                                new Notice("❌ Please enter an API Key first.");
+                                new Notice("❌ Please enter an API key first.");
                                 return;
                             }
                             button.setButtonText("Connecting...");
@@ -132,12 +131,12 @@ export class SatsetSyncSettingTab extends PluginSettingTab {
         }
 
         // --- Sync Configuration ---
-        containerEl.createEl("h3", { text: "Sync Configuration" });
+        new Setting(containerEl).setName("Sync configuration").setHeading();
 
         new Setting(containerEl)
-            .setName("Sync Folder")
+            .setName("Sync folder")
             .setDesc("The folder inside your vault where Satset notes will be saved.")
-            .addText((text: any) =>
+            .addText((text: TextComponent) =>
                 text
                     .setPlaceholder("Satset")
                     .setValue(this.plugin.settings.syncFolder)
@@ -148,9 +147,9 @@ export class SatsetSyncSettingTab extends PluginSettingTab {
             );
 
         new Setting(containerEl)
-            .setName("Auto-sync Interval (minutes)")
+            .setName("Auto-sync interval (minutes)")
             .setDesc("How often to automatically sync. Set to 0 to disable auto-sync.")
-            .addText((text: any) =>
+            .addText((text: TextComponent) =>
                 text
                     .setPlaceholder("5")
                     .setValue(String(this.plugin.settings.syncIntervalMinutes))
@@ -162,36 +161,34 @@ export class SatsetSyncSettingTab extends PluginSettingTab {
                     })
             );
 
-
-
         new Setting(containerEl)
-            .setName("Force Full Resync")
+            .setName("Force full resync")
             .setDesc("Clear sync history and re-download all notes.")
-            .addButton((button: any) =>
+            .addButton((button: ButtonComponent) =>
                 button
-                    .setButtonText("Reset Sync History")
+                    .setButtonText("Reset sync history")
                     .setWarning()
                     .onClick(async () => {
                         this.plugin.settings.lastSyncTime = "";
                         await this.plugin.saveSettings();
                         this.display();
-                        new Notice("History cleared. Click 'Sync Now' to re-download all notes.");
+                        new Notice("History cleared. Click 'Sync now' to re-download all notes.");
                     })
             );
 
         // --- Status Section ---
-        containerEl.createEl("h3", { text: "Status" });
+        new Setting(containerEl).setName("Status").setHeading();
 
         const lastSync = this.plugin.settings.lastSyncTime
             ? new Date(this.plugin.settings.lastSyncTime).toLocaleString()
             : "Never";
 
         new Setting(containerEl)
-            .setName("Last Sync")
+            .setName("Last sync")
             .setDesc(lastSync)
-            .addButton((button: any) =>
+            .addButton((button: ButtonComponent) =>
                 button
-                    .setButtonText("Sync Now")
+                    .setButtonText("Sync now")
                     .setDisabled(!isConnected)
                     .onClick(async () => {
                         button.setButtonText("Syncing...");
@@ -199,12 +196,12 @@ export class SatsetSyncSettingTab extends PluginSettingTab {
                         try {
                             await this.plugin.syncService.syncNotes();
                             this.display();
-                        } catch (e) {
+                        } catch (e: unknown) {
                             console.error("Sync failed:", e);
                             button.setButtonText("Failed");
                         } finally {
                             button.setDisabled(false);
-                            setTimeout(() => { if (button) button.setButtonText("Sync Now") }, 2000);
+                            setTimeout(() => { if (button) button.setButtonText("Sync now") }, 2000);
                         }
                     })
             );

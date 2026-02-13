@@ -1,1 +1,6 @@
-/* Satset Sync — no custom styles needed */
+/* Satset Sync — Plugin Styles */
+
+.satset-status-connected p {
+    color: var(--text-success);
+    font-weight: bold;
+}

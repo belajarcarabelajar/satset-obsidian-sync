@@ -7,7 +7,7 @@
  * Smart Sync: Uses satset_id in frontmatter to prevent duplicates,
  * handles renames, and supports incremental sync.
  */
-import { Notice, Vault, TFile, TFolder, normalizePath, requestUrl } from "obsidian";
+import { Notice, Vault, TFile, TFolder, normalizePath, requestUrl, RequestUrlParam } from "obsidian";
 import type SatsetSyncPlugin from "./main";
 
 // ── Encryption Constants (must match Satset web app) ──
@@ -70,7 +70,7 @@ async function decryptText(encrypted: string, key: CryptoKey): Promise<string> {
     const parts = encrypted.split("|");
     if (parts.length !== 4) throw new Error("Invalid encrypted format");
 
-    const [version, _salt, ivB64, ciphertextB64] = parts;
+    const [version, , ivB64, ciphertextB64] = parts;
     if (version !== ENCRYPTION_VERSION) throw new Error(`Unsupported encryption version: ${version}`);
 
     const iv = new Uint8Array(base64ToArrayBuffer(ivB64));
@@ -93,10 +93,10 @@ export class SyncService {
     }
 
     /** HTTP request to the sync-notes Edge Function. */
-    private async request(path: string, options: any = {}): Promise<any> {
+    private async request(path: string, options: Partial<RequestUrlParam> = {}): Promise<unknown> {
         const { supabaseUrl, apiKey } = this.plugin.settings;
         if (!supabaseUrl) throw new Error("Supabase URL not configured.");
-        if (!apiKey) throw new Error("API Key not configured.");
+        if (!apiKey) throw new Error("API key not configured.");
 
         const url = `${supabaseUrl}/functions/v1/sync-notes${path}`;
         const response = await requestUrl({
@@ -115,10 +115,10 @@ export class SyncService {
 
         // Handle specific error codes
         if (response.status === 401) {
-            throw new Error("Invalid or expired API Key. Please reconnect.");
+            throw new Error("Invalid or expired API key. Please reconnect.");
         }
         if (response.status === 403) {
-            throw new Error("API Key has been revoked. Generate a new one from the website.");
+            throw new Error("API key has been revoked. Generate a new one from the website.");
         }
         throw new Error(`HTTP ${response.status}: ${JSON.stringify(response.json)}`);
     }
@@ -126,7 +126,7 @@ export class SyncService {
     /** Connect using API Key: fetch config and derive encryption key. */
     async connect(): Promise<boolean> {
         try {
-            const config: ConfigResponse = await this.request("/config", { method: "GET" });
+            const config = await this.request("/config", { method: "GET" }) as ConfigResponse;
 
             this.plugin.settings.userId = config.userId;
             this.plugin.settings.email = config.email;
@@ -137,7 +137,6 @@ export class SyncService {
                 const salt = new Uint8Array(base64ToArrayBuffer(config.encryptionSalt));
                 const passphrase = `${config.userId}:${config.email}`;
                 this.encryptionKey = await deriveEncryptionKey(passphrase, salt);
-                console.log("[Satset Sync] Encryption key derived ✓");
             } else {
                 console.warn("[Satset Sync] No encryption salt found. Encrypted notes will be skipped.");
                 new Notice("⚠️ No encryption salt. Encrypted notes will be skipped.");
@@ -146,8 +145,9 @@ export class SyncService {
 
             new Notice(`✅ Connected as ${config.email}`);
             return true;
-        } catch (error: any) {
-            new Notice(`❌ Connection failed: ${error.message}`);
+        } catch (error: unknown) {
+            const message = error instanceof Error ? error.message : String(error);
+            new Notice(`❌ Connection failed: ${message}`);
             console.error("[Satset Sync] Connection error:", error);
             return false;
         }
@@ -187,8 +187,6 @@ export class SyncService {
                 // Skip unreadable files
             }
         }
-
-        console.log(`[Satset Sync] Indexed ${this.idToFileMap.size} files by satset_id.`);
     }
 
     /** Main sync function. */
@@ -196,14 +194,14 @@ export class SyncService {
         const { apiKey, syncFolder, lastSyncTime } = this.plugin.settings;
 
         if (!apiKey) {
-            new Notice("⚠️ Please connect with an API Key first.");
+            new Notice("⚠️ Please connect with an API key first.");
             return;
         }
 
         // Ensure encryption key is ready
         if (!this.encryptionKey && this.plugin.settings.userId) {
             try {
-                const config: ConfigResponse = await this.request("/config", { method: "GET" });
+                const config = await this.request("/config", { method: "GET" }) as ConfigResponse;
                 if (config.encryptionSalt) {
                     const salt = new Uint8Array(base64ToArrayBuffer(config.encryptionSalt));
                     const passphrase = `${config.userId}:${config.email}`;
@@ -223,10 +221,9 @@ export class SyncService {
                 query += `?since=${encodeURIComponent(lastSyncTime)}`;
             }
 
-            console.log(`[Satset Sync] Fetching notes: ${query}`);
             new Notice("🔄 Syncing notes...");
 
-            const result = await this.request(`/${query}`, { method: "GET" });
+            const result = await this.request(`/${query}`, { method: "GET" }) as { notes?: SatsetNote[] };
             const notes: SatsetNote[] = result.notes || [];
 
             if (notes.length === 0) {
@@ -251,8 +248,8 @@ export class SyncService {
                         note.content = note.content ? await decryptText(note.content, this.encryptionKey) : "";
                     } catch (err) {
                         console.warn(`[Satset Sync] Decrypt failed for ${note.id}:`, err);
-                        note.title = `Decryption Failed ${note.id.substring(0, 8)}`;
-                        note.content = `> [!ERROR] Decryption Failed\n> Could not decrypt this note. It might use a different key or be corrupted.\n\nRaw content length: ${note.content?.length ?? 0}`;
+                        note.title = `Decryption failed ${note.id.substring(0, 8)}`;
+                        note.content = `> [!ERROR] Decryption failed\n> Could not decrypt this note. It might use a different key or be corrupted.\n\nRaw content length: ${note.content?.length ?? 0}`;
                         decryptFailed++;
                     }
                 } else if (note.encrypted && !this.encryptionKey) {
@@ -261,11 +258,11 @@ export class SyncService {
                     continue;
                 }
 
-                const result = await this.writeNoteSmartSync(note, syncFolder);
-                if (result === "created") created++;
-                else if (result === "updated") updated++;
-                else if (result === "renamed") renamed++;
-                else if (result === "skipped") skipped++;
+                const syncResult = await this.writeNoteSmartSync(note, syncFolder);
+                if (syncResult === "created") created++;
+                else if (syncResult === "updated") updated++;
+                else if (syncResult === "renamed") renamed++;
+                else if (syncResult === "skipped") skipped++;
 
                 if (note.updated_at > maxUpdatedAt) {
                     maxUpdatedAt = note.updated_at;
@@ -283,9 +280,10 @@ export class SyncService {
             if (decryptFailed > 0) parts.push(`${decryptFailed} errors`);
 
             new Notice(`✅ Sync complete: ${parts.join(", ") || "no changes"}`);
-        } catch (error: any) {
+        } catch (error: unknown) {
+            const message = error instanceof Error ? error.message : String(error);
             console.error("[Satset Sync] Sync error:", error);
-            new Notice(`❌ Sync error: ${error.message}`);
+            new Notice(`❌ Sync error: ${message}`);
         }
     }
 
@@ -315,12 +313,6 @@ export class SyncService {
                 if (existingUpdatedAt && existingUpdatedAt >= note.updated_at) {
                     return "skipped";
                 }
-
-                // Determine target path (handling renames if title changed)
-                // We want to keep the SAME filename if title matches, or rename if it changed.
-                // If renaming, we must ensure the NEW name doesn't collide.
-                // But wait, if we are just updating, we usually keep the filename unless we force rename on title change.
-                // Let's stick to: Rename if title changed.
 
                 // Construct ideal path from current title
                 let targetPath = normalizePath(`${folderPath}/${title}.md`);
@@ -352,7 +344,6 @@ export class SyncService {
         }
 
         // Step 2: New file (or not found in index)
-        // Ensure we don't overwrite an existing file that belongs to a different ID (collision)
         let targetPath = normalizePath(`${folderPath}/${title}.md`);
         targetPath = await this.getUniquePath(targetPath, note.id);
 
@@ -379,28 +370,11 @@ export class SyncService {
 
             // File exists. Does it belong to THIS note?
             if (file instanceof TFile) {
-                // Check in-memory map first (fastest)
-                // If this file path is mapped to OUR noteId, then it's ours.
-                // iterate map? No, map is id -> path.
-                // We want path -> id.
-
-                // Let's check if the file content has our ID.
-                // Optimization: Check if the file path matches what we *expect* for this ID? 
-                // No, we are deciding the path.
-
-                // If the existing file has our ID, then we can overwrite it (it's the same note).
-                // BUT, `writeNoteSmartSync` Step 1 handles "Known existing file".
-                // We only call this when:
-                // A) We are creating a NEW note (Step 2) -> We shouldn't overwrite anything unless it's a ghost.
-                // B) We are RENAMING a note (Step 1) -> We shouldn't overwrite another note.
-
-                // So, if file exists, we MUST check its ID.
                 try {
                     const content = await vault.cachedRead(file);
                     const existingId = this.extractFrontmatterValue(content, "satset_id");
 
                     if (existingId === noteId) {
-                        // It's us! (Maybe map was out of sync, or we are renaming to same name?)
                         return candidatePath;
                     }
                 } catch {
@@ -409,7 +383,6 @@ export class SyncService {
             }
 
             // Collision! Append counter.
-            // strip extension
             const extIndex = basePath.lastIndexOf(".");
             const base = extIndex > -1 ? basePath.substring(0, extIndex) : basePath;
             const ext = extIndex > -1 ? basePath.substring(extIndex) : "";

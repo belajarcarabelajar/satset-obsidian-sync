@@ -18,21 +18,19 @@ export default class SatsetSyncPlugin extends Plugin {
     private autoSyncInterval: number | null = null;
 
     async onload() {
-        console.log("[Satset Sync] Loading plugin...");
-
         await this.loadSettings();
 
         // Add settings tab
         this.addSettingTab(new SatsetSyncSettingTab(this.app, this));
 
         // Add ribbon icon for manual sync
-        this.addRibbonIcon("refresh-cw", "Satset Sync: Sync Now", async () => {
+        this.addRibbonIcon("refresh-cw", "Sync notes from Satset", async () => {
             await this.syncService.syncNotes();
         });
 
         // Add command: Sync Now
         this.addCommand({
-            id: "satset-sync-now",
+            id: "sync-now",
             name: "Sync notes from Satset",
             callback: async () => {
                 await this.syncService.syncNotes();
@@ -41,12 +39,9 @@ export default class SatsetSyncPlugin extends Plugin {
 
         // Start auto-sync if configured
         this.startAutoSync();
-
-        console.log("[Satset Sync] Plugin loaded successfully.");
     }
 
     onunload() {
-        console.log("[Satset Sync] Unloading plugin...");
         this.stopAutoSync();
     }
 
@@ -68,15 +63,12 @@ export default class SatsetSyncPlugin extends Plugin {
         if (minutes <= 0 || !this.settings.apiKey) return;
 
         const ms = minutes * 60 * 1000;
-        this.autoSyncInterval = window.setInterval(async () => {
-            console.log("[Satset Sync] Auto-sync triggered.");
-            await this.syncService.syncNotes();
+        this.autoSyncInterval = window.setInterval(() => {
+            this.syncService.syncNotes();
         }, ms);
 
         // Register the interval so Obsidian can clean it up
         this.registerInterval(this.autoSyncInterval);
-
-        console.log(`[Satset Sync] Auto-sync started (every ${minutes} min).`);
     }
 
     /**
