@@ -193,7 +193,7 @@ export class SyncService {
 
     /** Main sync function. */
     async syncNotes(): Promise<void> {
-        const { apiKey, syncFolder, lastSyncTime, includeArchived } = this.plugin.settings;
+        const { apiKey, syncFolder, lastSyncTime } = this.plugin.settings;
 
         if (!apiKey) {
             new Notice("⚠️ Please connect with an API Key first.");
@@ -218,9 +218,9 @@ export class SyncService {
             // Build the ID -> file path index
             await this.buildIdIndex(syncFolder);
 
-            let query = `?include_archived=${includeArchived}`;
+            let query = "";
             if (lastSyncTime) {
-                query += `&since=${encodeURIComponent(lastSyncTime)}`;
+                query += `?since=${encodeURIComponent(lastSyncTime)}`;
             }
 
             console.log(`[Satset Sync] Fetching notes: ${query}`);

@@ -28,9 +28,6 @@ export interface SatsetSyncSettings {
 
     /** ISO timestamp of the last successful sync */
     lastSyncTime: string;
-
-    /** Whether to include archived notes */
-    includeArchived: boolean;
 }
 
 export const DEFAULT_SETTINGS: SatsetSyncSettings = {
@@ -41,7 +38,6 @@ export const DEFAULT_SETTINGS: SatsetSyncSettings = {
     syncFolder: "Satset",
     syncIntervalMinutes: 5,
     lastSyncTime: "",
-    includeArchived: false,
 };
 
 export class SatsetSyncSettingTab extends PluginSettingTab {
@@ -166,17 +162,7 @@ export class SatsetSyncSettingTab extends PluginSettingTab {
                     })
             );
 
-        new Setting(containerEl)
-            .setName("Include Archived Notes")
-            .setDesc("Whether to also sync notes that you've archived in Satset.")
-            .addToggle((toggle: any) =>
-                toggle
-                    .setValue(this.plugin.settings.includeArchived)
-                    .onChange(async (value: boolean) => {
-                        this.plugin.settings.includeArchived = value;
-                        await this.plugin.saveSettings();
-                    })
-            );
+
 
         new Setting(containerEl)
             .setName("Force Full Resync")
