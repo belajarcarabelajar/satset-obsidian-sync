@@ -1,0 +1,10 @@
+{
+    "id": "satset-sync",
+    "name": "Satset Sync",
+    "version": "1.0.0",
+    "minAppVersion": "1.0.0",
+    "description": "Synchronize your Satset Note-taking notes directly into your Obsidian vault.",
+    "author": "Satset Note-taking",
+    "authorUrl": "https://satset-notetaking.lovable.app",
+    "isDesktopOnly": false
+}
