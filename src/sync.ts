@@ -146,7 +146,7 @@ export class SyncService {
             if (attempt > 0) {
                 const jitter = Math.random() * 500;
                 const delay = BASE_DELAY_MS * Math.pow(2, attempt - 1) + jitter;
-                console.log(
+                console.debug(
                     `[Satset Sync] Retry ${attempt}/${MAX_RETRIES} in ${Math.round(delay)}ms...`
                 );
                 await this.sleep(delay);
@@ -334,7 +334,7 @@ export class SyncService {
                     try {
                         note.title = await decryptText(note.title, this.encryptionKey);
                         note.content = note.content ? await decryptText(note.content, this.encryptionKey) : "";
-                    } catch (err) {
+                    } catch (err: unknown) {
                         console.warn(`[Satset Sync] Decrypt failed for ${note.id}:`, err);
                         note.title = `Decryption failed ${note.id.substring(0, 8)}`;
                         note.content = `> [!ERROR] Decryption failed\n> Could not decrypt this note. It might use a different key or be corrupted.\n\nRaw content length: ${note.content?.length ?? 0}`;
@@ -443,10 +443,10 @@ export class SyncService {
                     delete this.plugin.settings.syncedFiles[del.note_id];
 
                     archived++;
-                    console.log(
+                    console.debug(
                         `[Satset Sync] Archived deleted note: ${existingPath} → ${archivePath}`
                     );
-                } catch (err) {
+                } catch (err: unknown) {
                     console.warn(
                         `[Satset Sync] Failed to archive ${existingPath}:`,
                         err
@@ -462,7 +462,7 @@ export class SyncService {
             }
 
             return archived;
-        } catch (error) {
+        } catch (error: unknown) {
             console.warn("[Satset Sync] Deletion sync skipped:", error);
             return 0;
         }
@@ -539,7 +539,7 @@ export class SyncService {
                         this.idToFileMap.set(note.id, targetPath);
                         this.plugin.settings.syncedFiles[note.id] = serverHash;
                         return "renamed";
-                    } catch (err) {
+                    } catch (err: unknown) {
                         console.warn(`[Satset Sync] Rename failed for ${note.id}, updating in place:`, err);
                         await vault.modify(existingFile, content);
                         this.plugin.settings.syncedFiles[note.id] = serverHash;

@@ -88,7 +88,7 @@ export default class SatsetSyncPlugin extends Plugin {
         const ms = minutes * 60 * 1000;
         this.backoffCycleCount = 0;
 
-        this.autoSyncInterval = window.setInterval(async () => {
+        this.autoSyncInterval = window.setInterval(() => {
             const failures = this.syncService.consecutiveFailures;
 
             if (failures >= 3) {
@@ -99,7 +99,7 @@ export default class SatsetSyncPlugin extends Plugin {
                 this.backoffCycleCount++;
 
                 if (this.backoffCycleCount % skipFactor !== 0) {
-                    console.log(
+                    console.debug(
                         `[Satset Sync] Auto-sync backed off ` +
                         `(${failures} consecutive failures, ` +
                         `syncing every ${skipFactor} cycles, ` +
@@ -112,7 +112,7 @@ export default class SatsetSyncPlugin extends Plugin {
                 this.backoffCycleCount = 0;
             }
 
-            await this.syncService.syncNotes();
+            void this.syncService.syncNotes();
         }, ms);
 
         // Register the interval so Obsidian can clean it up

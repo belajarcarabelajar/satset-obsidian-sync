@@ -97,7 +97,7 @@ export class SatsetSyncSettingTab extends PluginSettingTab {
 
             new Setting(containerEl)
                 .setName("API key")
-                .setDesc("Generate an API key from the Satset website (Integrations page).")
+                .setDesc("Generate an API key from the Satset website (integrations page).")
                 .addText((text: TextComponent) => {
                     text.inputEl.type = "password";
                     text.inputEl.style.width = "100%";
