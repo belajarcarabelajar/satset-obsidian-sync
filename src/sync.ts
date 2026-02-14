@@ -14,6 +14,12 @@
 import { Notice, Vault, TFile, TFolder, normalizePath, requestUrl, RequestUrlParam } from "obsidian";
 import type SatsetSyncPlugin from "./main";
 
+// ── Supabase Gateway Auth ──
+// The anon key is required by Supabase API gateway to route requests to Edge Functions.
+// This is a PUBLIC key (same as in the web app client) — it only grants anon-level access.
+// Actual auth is handled by our custom x-api-key mechanism inside the Edge Function.
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Iml4dmJzZXh1anhkYmJ2enZteWJqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDk5Mzg4MDAsImV4cCI6MjA2NTUxNDgwMH0.CYpokPpeceFYzh9gMh-ymGYte9iCWcNamCCIc56Fh1I";
+
 // ── Encryption Constants (must match Satset web app) ──
 const ENCRYPTION_VERSION = "v1";
 const PBKDF2_ITERATIONS = 100000;
@@ -118,11 +124,14 @@ export class SyncService {
     /**
      * HTTP request to the sync-notes Edge Function with retry + exponential backoff.
      *
+     * Headers:
+     * - `apikey` + `Authorization`: Supabase API gateway auth (anon key, public).
+     * - `x-api-key`: Our custom auth, validated inside the Edge Function.
+     *
      * Retry policy:
      * - Retries up to MAX_RETRIES times for transient errors (5xx, network failures).
      * - Uses exponential backoff: 1s, 2s, 4s + random jitter (0–500ms).
-     * - Does NOT retry client errors (4xx) as they indicate permanent failures
-     *   (invalid API key, revoked key, bad request, expired key).
+     * - Does NOT retry client errors (4xx) as they indicate permanent failures.
      */
     private async request(path: string, options: Partial<RequestUrlParam> = {}): Promise<unknown> {
         const { supabaseUrl, apiKey } = this.plugin.settings;
@@ -149,6 +158,8 @@ export class SyncService {
                     ...options,
                     headers: {
                         "Content-Type": "application/json",
+                        "apikey": SUPABASE_ANON_KEY,
+                        "Authorization": `Bearer ${SUPABASE_ANON_KEY}`,
                         "x-api-key": apiKey,
                         ...options.headers,
                     },
@@ -352,7 +363,6 @@ export class SyncService {
             }
 
             // ── Soft Delete Sync ──
-            // After syncing notes, check for deletions and archive locally
             const archived = await this.syncDeletions(syncFolder, lastSyncTime);
 
             this.plugin.settings.lastSyncTime = maxUpdatedAt;
@@ -384,15 +394,6 @@ export class SyncService {
 
     /**
      * Sync deletions: query the /deleted endpoint and archive local files.
-     *
-     * Strategy: SOFT DELETE (move to _archived/ subfolder).
-     * - Files are moved, not deleted, so the user can recover them.
-     * - Frontmatter `satset_id` is renamed to `satset_deleted_from` to prevent
-     *   the archived file from being picked up by future buildIdIndex scans.
-     * - syncedFiles tracking is cleaned up for archived notes.
-     *
-     * This method is non-fatal: if the /deleted endpoint doesn't exist yet
-     * (e.g. migration not applied), it silently returns 0.
      */
     private async syncDeletions(syncFolder: string, lastSyncTime: string): Promise<number> {
         try {
@@ -416,25 +417,21 @@ export class SyncService {
 
             for (const del of deletedNotes) {
                 const existingPath = this.idToFileMap.get(del.note_id);
-                if (!existingPath) continue; // File not in vault, skip
+                if (!existingPath) continue;
 
                 const file = vault.getAbstractFileByPath(existingPath);
                 if (!(file instanceof TFile)) continue;
 
                 try {
-                    // Determine unique archive path
                     let archivePath = normalizePath(`${archiveFolder}/${file.name}`);
                     archivePath = await this.getUniqueArchivePath(archivePath);
 
-                    // 1. Move file to _archived/
                     await vault.rename(file, archivePath);
 
-                    // 2. Strip satset_id to prevent re-indexing
                     const archivedFile = vault.getAbstractFileByPath(archivePath);
                     if (archivedFile instanceof TFile) {
                         let content = await vault.read(archivedFile);
                         content = content.replace(/^satset_id:/m, "satset_deleted_from:");
-                        // Add deletion timestamp to frontmatter
                         content = content.replace(
                             /^---\n/m,
                             `---\ndeleted_at: "${del.deleted_at}"\n`
@@ -442,7 +439,6 @@ export class SyncService {
                         await vault.modify(archivedFile, content);
                     }
 
-                    // 3. Clean up tracking
                     this.idToFileMap.delete(del.note_id);
                     delete this.plugin.settings.syncedFiles[del.note_id];
 
@@ -467,24 +463,13 @@ export class SyncService {
 
             return archived;
         } catch (error) {
-            // Non-fatal: /deleted endpoint might not exist yet (migration not applied)
             console.warn("[Satset Sync] Deletion sync skipped:", error);
             return 0;
         }
     }
 
     /**
-     * Smart Sync write logic with ONE-WAY SYNC PROTECTION:
-     * 1. Check if local file exists (via ID index).
-     * 2. If exists:
-     *    - Calculate hash of local BODY.
-     *    - Compare with lastSyncedHash (from settings).
-     *    - If mismatch (User edited local):
-     *      - Create CONFLICT COPY of local file (backup).
-     *      - Overwrite main file with server content.
-     *    - If match (Clean):
-     *      - Overwrite safely.
-     * 3. Update syncedFiles map with new server content hash.
+     * Smart Sync write logic with ONE-WAY SYNC PROTECTION.
      */
     private async writeNoteSmartSync(
         note: SatsetNote, folderPath: string
@@ -492,10 +477,8 @@ export class SyncService {
         const vault: Vault = this.plugin.app.vault;
         const title = this.sanitizeFilename(note.title || "Untitled");
         const content = this.noteToMarkdown(note);
-        // Compute hash of the INCOMING server content (to store as new baseline)
         const serverHash = await this.computeBodyHash(content);
 
-        // Step 1: Check if a file with this satset_id already exists
         const existingPath = this.idToFileMap.get(note.id);
 
         if (existingPath) {
@@ -503,7 +486,6 @@ export class SyncService {
             if (existingFile instanceof TFile) {
                 const existingContent = await vault.read(existingFile);
 
-                // Check if we need to update at all (server updated_at vs local updated_at)
                 const existingUpdatedAt = this.extractFrontmatterValue(existingContent, "updated_at");
                 if (existingUpdatedAt && existingUpdatedAt >= note.updated_at) {
                     if (!this.plugin.settings.syncedFiles[note.id]) {
@@ -513,17 +495,14 @@ export class SyncService {
                     return "skipped";
                 }
 
-                // Server has updates. Now check for conflicts.
                 const localHash = await this.computeBodyHash(existingContent);
                 const lastSyncedHash = this.plugin.settings.syncedFiles[note.id];
 
-                // CONFLICT DETECTION
                 const isDirty = lastSyncedHash
                     ? localHash !== lastSyncedHash
                     : localHash !== serverHash;
 
                 if (isDirty) {
-                    // Conflict! Backup local file.
                     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
                     const conflictFilename = `${existingFile.basename} (Conflict ${timestamp}).md`;
                     const conflictPath = normalizePath(`${existingFile.parent?.path}/${conflictFilename}`);
@@ -547,7 +526,6 @@ export class SyncService {
                     return "updated";
                 }
 
-                // Not dirty — safe to overwrite
                 let targetPath = normalizePath(`${folderPath}/${title}.md`);
 
                 if (existingFile.path !== targetPath) {
@@ -575,7 +553,6 @@ export class SyncService {
             }
         }
 
-        // New file
         let targetPath = normalizePath(`${folderPath}/${title}.md`);
         targetPath = await this.getUniquePath(targetPath, note.id);
 
@@ -585,10 +562,6 @@ export class SyncService {
         return "created";
     }
 
-    /**
-     * Generates a unique file path by appending (1), (2), etc. if the path exists
-     * and belongs to a different note (or is unmanaged).
-     */
     private async getUniquePath(basePath: string, noteId: string): Promise<string> {
         const vault: Vault = this.plugin.app.vault;
         let candidatePath = basePath;
@@ -620,10 +593,6 @@ export class SyncService {
         }
     }
 
-    /**
-     * Generates a unique archive path by appending (1), (2), etc.
-     * Simpler than getUniquePath since we don't check satset_id.
-     */
     private async getUniqueArchivePath(basePath: string): Promise<string> {
         const vault: Vault = this.plugin.app.vault;
         let candidatePath = basePath;
