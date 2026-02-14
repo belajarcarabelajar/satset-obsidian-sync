@@ -3,9 +3,11 @@
  *
  * Handles communication with the Satset sync-notes Edge Function via API Key,
  * writing/updating Markdown files in Obsidian, and AES-GCM decryption.
- * 
+ *
  * Smart Sync: Uses satset_id in frontmatter to prevent duplicates,
  * handles renames, and supports incremental sync.
+ *
+ * Retry: HTTP requests use exponential backoff (3 retries) for transient errors.
  */
 import { Notice, Vault, TFile, TFolder, normalizePath, requestUrl, RequestUrlParam } from "obsidian";
 import type SatsetSyncPlugin from "./main";
@@ -14,6 +16,10 @@ import type SatsetSyncPlugin from "./main";
 const ENCRYPTION_VERSION = "v1";
 const PBKDF2_ITERATIONS = 100000;
 const KEY_LENGTH = 256;
+
+// ── Retry Constants ──
+const MAX_RETRIES = 3;
+const BASE_DELAY_MS = 1000; // 1s → 2s → 4s
 
 // ── Interfaces ──
 interface SatsetNote {
@@ -88,39 +94,105 @@ export class SyncService {
     // In-memory index: satset_id -> file path (built on each sync)
     private idToFileMap: Map<string, string> = new Map();
 
+    /** Number of consecutive sync failures. Reset to 0 on successful sync. */
+    public consecutiveFailures = 0;
+
     constructor(plugin: SatsetSyncPlugin) {
         this.plugin = plugin;
     }
 
-    /** HTTP request to the sync-notes Edge Function. */
+    // ── Utility ──
+
+    /** Promise-based sleep for retry delays. */
+    private sleep(ms: number): Promise<void> {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    /**
+     * HTTP request to the sync-notes Edge Function with retry + exponential backoff.
+     *
+     * Retry policy:
+     * - Retries up to MAX_RETRIES times for transient errors (5xx, network failures).
+     * - Uses exponential backoff: 1s, 2s, 4s + random jitter (0–500ms).
+     * - Does NOT retry client errors (4xx) as they indicate permanent failures
+     *   (invalid API key, revoked key, bad request, expired key).
+     */
     private async request(path: string, options: Partial<RequestUrlParam> = {}): Promise<unknown> {
         const { supabaseUrl, apiKey } = this.plugin.settings;
         if (!supabaseUrl) throw new Error("Supabase URL not configured.");
         if (!apiKey) throw new Error("API key not configured.");
 
         const url = `${supabaseUrl}/functions/v1/sync-notes${path}`;
-        const response = await requestUrl({
-            url,
-            ...options,
-            headers: {
-                "Content-Type": "application/json",
-                "x-api-key": apiKey,
-                ...options.headers,
-            },
-        });
+        let lastError: Error = new Error("Request failed");
 
-        if (response.status >= 200 && response.status < 300) {
-            return response.json;
+        for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+            // Exponential backoff before retry (skip on first attempt)
+            if (attempt > 0) {
+                const jitter = Math.random() * 500;
+                const delay = BASE_DELAY_MS * Math.pow(2, attempt - 1) + jitter;
+                console.log(
+                    `[Satset Sync] Retry ${attempt}/${MAX_RETRIES} in ${Math.round(delay)}ms...`
+                );
+                await this.sleep(delay);
+            }
+
+            try {
+                const response = await requestUrl({
+                    url,
+                    ...options,
+                    headers: {
+                        "Content-Type": "application/json",
+                        "x-api-key": apiKey,
+                        ...options.headers,
+                    },
+                });
+
+                // ── Success ──
+                if (response.status >= 200 && response.status < 300) {
+                    return response.json;
+                }
+
+                // ── Client errors (4xx) — permanent, do NOT retry ──
+                if (response.status === 401) {
+                    throw new Error(
+                        "Invalid or expired API key. Please generate a new one from the website."
+                    );
+                }
+                if (response.status === 403) {
+                    throw new Error(
+                        "API key has been revoked. Generate a new one from the website."
+                    );
+                }
+                if (response.status >= 400 && response.status < 500) {
+                    throw new Error(`HTTP ${response.status}: ${JSON.stringify(response.json)}`);
+                }
+
+                // ── Server errors (5xx) — transient, retry ──
+                lastError = new Error(
+                    `Server error (HTTP ${response.status}). ` +
+                    (attempt < MAX_RETRIES ? "Retrying..." : "All retries exhausted.")
+                );
+            } catch (error: unknown) {
+                const err = error instanceof Error ? error : new Error(String(error));
+
+                // If it's a non-retryable error we threw above, propagate immediately
+                if (
+                    err.message.includes("API key") ||
+                    err.message.includes("not configured") ||
+                    err.message.startsWith("HTTP 4")
+                ) {
+                    throw err;
+                }
+
+                // Network error or unexpected failure — retry
+                lastError = err;
+            }
         }
 
-        // Handle specific error codes
-        if (response.status === 401) {
-            throw new Error("Invalid or expired API key. Please reconnect.");
-        }
-        if (response.status === 403) {
-            throw new Error("API key has been revoked. Generate a new one from the website.");
-        }
-        throw new Error(`HTTP ${response.status}: ${JSON.stringify(response.json)}`);
+        // All retries exhausted
+        throw new Error(
+            `Request failed after ${MAX_RETRIES} retries: ${lastError.message}`
+        );
     }
 
     /** Connect using API Key: fetch config and derive encryption key. */
@@ -143,9 +215,11 @@ export class SyncService {
                 this.encryptionKey = null;
             }
 
+            this.consecutiveFailures = 0;
             new Notice(`✅ Connected as ${config.email}`);
             return true;
         } catch (error: unknown) {
+            this.consecutiveFailures++;
             const message = error instanceof Error ? error.message : String(error);
             new Notice(`❌ Connection failed: ${message}`);
             console.error("[Satset Sync] Connection error:", error);
@@ -159,6 +233,7 @@ export class SyncService {
         this.plugin.settings.userId = "";
         this.plugin.settings.email = "";
         this.encryptionKey = null;
+        this.consecutiveFailures = 0;
         await this.plugin.saveSettings();
         new Notice("👋 Disconnected.");
     }
@@ -227,6 +302,7 @@ export class SyncService {
             const notes: SatsetNote[] = result.notes || [];
 
             if (notes.length === 0) {
+                this.consecutiveFailures = 0;
                 new Notice("✅ Already up to date.");
                 return;
             }
@@ -277,6 +353,9 @@ export class SyncService {
             this.plugin.settings.lastSyncTime = maxUpdatedAt;
             await this.plugin.saveSettings();
 
+            // ✅ Sync succeeded — reset failure counter
+            this.consecutiveFailures = 0;
+
             const parts: string[] = [];
             if (created > 0) parts.push(`${created} created`);
             if (updated > 0) parts.push(`${updated} updated`);
@@ -286,8 +365,9 @@ export class SyncService {
 
             new Notice(`✅ Sync complete: ${parts.join(", ") || "no changes"}`);
         } catch (error: unknown) {
+            this.consecutiveFailures++;
             const message = error instanceof Error ? error.message : String(error);
-            console.error("[Satset Sync] Sync error:", error);
+            console.error(`[Satset Sync] Sync error (failure #${this.consecutiveFailures}):`, error);
             new Notice(`❌ Sync error: ${message}`);
         }
     }

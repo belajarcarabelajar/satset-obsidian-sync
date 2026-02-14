@@ -3,6 +3,10 @@
  *
  * This Obsidian plugin synchronizes notes from Satset Note-taking
  * into the user's local Obsidian vault.
+ *
+ * Auto-sync includes exponential backoff: after repeated failures,
+ * the plugin progressively skips sync cycles to avoid hammering
+ * an unreachable server.
  */
 import { Plugin } from "obsidian";
 import {
@@ -17,6 +21,13 @@ export default class SatsetSyncPlugin extends Plugin {
     syncService: SyncService = new SyncService(this);
     private autoSyncInterval: number | null = null;
 
+    /**
+     * Cycle counter used by backoff logic.
+     * Incremented every auto-sync tick; compared against a skip factor
+     * derived from consecutiveFailures to decide whether to sync or skip.
+     */
+    private backoffCycleCount = 0;
+
     async onload() {
         await this.loadSettings();
 
@@ -25,6 +36,7 @@ export default class SatsetSyncPlugin extends Plugin {
 
         // Add ribbon icon for manual sync
         this.addRibbonIcon("refresh-cw", "Sync notes from Satset", async () => {
+            // Manual sync always runs immediately (no backoff)
             await this.syncService.syncNotes();
         });
 
@@ -33,6 +45,7 @@ export default class SatsetSyncPlugin extends Plugin {
             id: "sync-now",
             name: "Sync notes from Satset",
             callback: async () => {
+                // Manual sync always runs immediately (no backoff)
                 await this.syncService.syncNotes();
             },
         });
@@ -54,7 +67,17 @@ export default class SatsetSyncPlugin extends Plugin {
     }
 
     /**
-     * Start the auto-sync interval timer.
+     * Start the auto-sync interval timer with backoff support.
+     *
+     * Backoff behaviour:
+     * - 0–2 consecutive failures  → sync every cycle (normal)
+     * - 3–5 consecutive failures  → sync every 2nd cycle
+     * - 6–8 consecutive failures  → sync every 4th cycle
+     * - 9–11 consecutive failures → sync every 8th cycle
+     * - 12+ consecutive failures  → sync every 16th cycle (max)
+     *
+     * Example: with a 5-min interval and 6 failures, effective interval
+     * becomes ~20 min. Manual sync always bypasses this backoff.
      */
     startAutoSync() {
         this.stopAutoSync();
@@ -63,8 +86,33 @@ export default class SatsetSyncPlugin extends Plugin {
         if (minutes <= 0 || !this.settings.apiKey) return;
 
         const ms = minutes * 60 * 1000;
-        this.autoSyncInterval = window.setInterval(() => {
-            this.syncService.syncNotes();
+        this.backoffCycleCount = 0;
+
+        this.autoSyncInterval = window.setInterval(async () => {
+            const failures = this.syncService.consecutiveFailures;
+
+            if (failures >= 3) {
+                // Calculate skip factor: 2^(tier-1), capped at 16
+                const tier = Math.floor(failures / 3); // 1, 2, 3, 4+
+                const skipFactor = Math.min(Math.pow(2, tier), 16);
+
+                this.backoffCycleCount++;
+
+                if (this.backoffCycleCount % skipFactor !== 0) {
+                    console.log(
+                        `[Satset Sync] Auto-sync backed off ` +
+                        `(${failures} consecutive failures, ` +
+                        `syncing every ${skipFactor} cycles, ` +
+                        `~${minutes * skipFactor} min effective interval)`
+                    );
+                    return;
+                }
+            } else {
+                // Reset counter when healthy
+                this.backoffCycleCount = 0;
+            }
+
+            await this.syncService.syncNotes();
         }, ms);
 
         // Register the interval so Obsidian can clean it up
