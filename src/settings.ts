@@ -28,6 +28,9 @@ export interface SatsetSyncSettings {
 
     /** ISO timestamp of the last successful sync */
     lastSyncTime: string;
+
+    /** Map of satset_id -> SHA-256 hash of the content (excluding frontmatter) */
+    syncedFiles: Record<string, string>;
 }
 
 export const DEFAULT_SETTINGS: SatsetSyncSettings = {
@@ -38,6 +41,7 @@ export const DEFAULT_SETTINGS: SatsetSyncSettings = {
     syncFolder: "Satset",
     syncIntervalMinutes: 5,
     lastSyncTime: "",
+    syncedFiles: {},
 };
 
 export class SatsetSyncSettingTab extends PluginSettingTab {
@@ -170,6 +174,7 @@ export class SatsetSyncSettingTab extends PluginSettingTab {
                     .setWarning()
                     .onClick(async () => {
                         this.plugin.settings.lastSyncTime = "";
+                        this.plugin.settings.syncedFiles = {};
                         await this.plugin.saveSettings();
                         this.display();
                         new Notice("History cleared. Click 'Sync now' to re-download all notes.");

@@ -267,6 +267,11 @@ export class SyncService {
                 if (note.updated_at > maxUpdatedAt) {
                     maxUpdatedAt = note.updated_at;
                 }
+
+                // Batch save settings (every 10 items) to persist hashes
+                if ((created + updated + renamed + skipped) % 10 === 0) {
+                    await this.plugin.saveSettings();
+                }
             }
 
             this.plugin.settings.lastSyncTime = maxUpdatedAt;
@@ -288,10 +293,17 @@ export class SyncService {
     }
 
     /**
-     * Smart Sync write logic:
-     * 1. Check ID index for existing file with same satset_id.
-     * 2. If found: compare updated_at, skip if unchanged, update if changed, rename if title changed.
-     * 3. If not found: find a UNIQUE filename (handle collisions) and create.
+     * Smart Sync write logic with ONE-WAY SYNC PROTECTION:
+     * 1. Check if local file exists (via ID index).
+     * 2. If exists:
+     *    - Calculate hash of local BODY.
+     *    - Compare with lastSyncedHash (from settings).
+     *    - If mismatch (User edited local):
+     *      - Create CONFLICT COPY of local file (backup).
+     *      - Overwrite main file with server content.
+     *    - If match (Clean):
+     *      - Overwrite safely.
+     * 3. Update syncedFiles map with new server content hash.
      */
     private async writeNoteSmartSync(
         note: SatsetNote, folderPath: string
@@ -299,29 +311,68 @@ export class SyncService {
         const vault: Vault = this.plugin.app.vault;
         const title = this.sanitizeFilename(note.title || "Untitled");
         const content = this.noteToMarkdown(note);
+        // Compute hash of the INCOMING server content (to store as new baseline)
+        const serverHash = await this.computeBodyHash(content);
 
-        // Step 1: Check if a file with this satset_id already exists (mapped by previous syncs)
+        // Step 1: Check if a file with this satset_id already exists
         const existingPath = this.idToFileMap.get(note.id);
 
         if (existingPath) {
             const existingFile = vault.getAbstractFileByPath(existingPath);
             if (existingFile instanceof TFile) {
                 const existingContent = await vault.read(existingFile);
-                const existingUpdatedAt = this.extractFrontmatterValue(existingContent, "updated_at");
 
-                // Skip if local file is already up to date
+                // Check if we need to update at all (server updated_at vs local updated_at)
+                // Note: We still check updated_at to skip unnecessary writes if server hasn't changed
+                const existingUpdatedAt = this.extractFrontmatterValue(existingContent, "updated_at");
                 if (existingUpdatedAt && existingUpdatedAt >= note.updated_at) {
+                    // Update our hash record just in case (e.g. first sync after update)
+                    if (!this.plugin.settings.syncedFiles[note.id]) {
+                        const localHash = await this.computeBodyHash(existingContent);
+                        this.plugin.settings.syncedFiles[note.id] = localHash;
+                    }
                     return "skipped";
                 }
+
+                // Server has updates. Now check for conflicts.
+                const localHash = await this.computeBodyHash(existingContent);
+                const lastSyncedHash = this.plugin.settings.syncedFiles[note.id];
+
+                // CONFLICT DETECTION:
+                // If we have a recorded hash, and local differs from it -> User edited local.
+                // If we don't have a record (legacy/first run), assume "dirty" if content looks different? 
+                // Creating a conflict copy is safer than losing data.
+                const isDirty = lastSyncedHash && localHash !== lastSyncedHash;
+
+                if (isDirty) {
+                    // Conflict! Backup local file.
+                    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+                    const conflictFilename = `${existingFile.basename} (Conflict ${timestamp}).md`;
+                    const conflictPath = normalizePath(`${existingFile.parent?.path}/${conflictFilename}`);
+
+                    // Rename current logic file to conflict name
+                    await vault.rename(existingFile, conflictPath);
+                    new Notice(`⚠️ Conflict detected: ${existingFile.basename}. \nLocal changes backed up to "${conflictFilename}".`);
+
+                    // Now simple-create the new file at the original expected path (or new title path)
+                    // We need to re-determine target path because we just moved the file
+                    let targetPath = normalizePath(`${folderPath}/${title}.md`);
+                    targetPath = await this.getUniquePath(targetPath, note.id);
+
+                    await vault.create(targetPath, content);
+                    this.idToFileMap.set(note.id, targetPath);
+                    this.plugin.settings.syncedFiles[note.id] = serverHash;
+                    return "updated";
+                }
+
+                // If not dirty (or no local changes), we can safely overwrite.
 
                 // Construct ideal path from current title
                 let targetPath = normalizePath(`${folderPath}/${title}.md`);
 
-                // Only rename if the path implies a title change
+                // Check for rename
                 if (existingFile.path !== targetPath) {
-                    // Ensure targetPath is unique (could match another note's title)
                     targetPath = await this.getUniquePath(targetPath, note.id);
-
                     try {
                         await vault.rename(existingFile, targetPath);
                         const renamedFile = vault.getAbstractFileByPath(targetPath);
@@ -329,16 +380,19 @@ export class SyncService {
                             await vault.modify(renamedFile, content);
                         }
                         this.idToFileMap.set(note.id, targetPath);
+                        this.plugin.settings.syncedFiles[note.id] = serverHash;
                         return "renamed";
                     } catch (err) {
                         console.warn(`[Satset Sync] Rename failed for ${note.id}, updating in place:`, err);
                         await vault.modify(existingFile, content);
+                        this.plugin.settings.syncedFiles[note.id] = serverHash;
                         return "updated";
                     }
                 }
 
                 // Same filename, just update content
                 await vault.modify(existingFile, content);
+                this.plugin.settings.syncedFiles[note.id] = serverHash;
                 return "updated";
             }
         }
@@ -349,6 +403,7 @@ export class SyncService {
 
         await vault.create(targetPath, content);
         this.idToFileMap.set(note.id, targetPath);
+        this.plugin.settings.syncedFiles[note.id] = serverHash;
         return "created";
     }
 
@@ -431,5 +486,30 @@ export class SyncService {
         if (!vault.getAbstractFileByPath(normalizedPath)) {
             await vault.createFolder(normalizedPath);
         }
+    }
+
+    /**
+     * Extracts the body of the note, excluding the frontmatter.
+     * Robustly handles different frontmatter formats.
+     */
+    private extractBody(content: string): string {
+        // Match content after the second "---" delimiter
+        const match = content.match(/^---\n[\s\S]*?\n---\n([\s\S]*)$/);
+        return match ? match[1] : content;
+    }
+
+    /**
+     * Computes SHA-256 hash of the normalized note body.
+     * Normalizes line endings to \n to ensure cross-platform consistency.
+     */
+    private async computeBodyHash(content: string): Promise<string> {
+        const body = this.extractBody(content);
+        // Normalize line endings to \n
+        const normalized = body.replace(/\r\n/g, "\n");
+        const encoder = new TextEncoder();
+        const data = encoder.encode(normalized);
+        const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+        const hashArray = Array.from(new Uint8Array(hashBuffer));
+        return hashArray.map(b => b.toString(16).padStart(2, "0")).join("");
     }
 }
