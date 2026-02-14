@@ -5,7 +5,7 @@ Synchronize your [Satset Note-taking](https://satset-notetaking.lovable.app) not
 ## ✨ Features
 
 - **One-way sync** (Satset → Obsidian) — your notes in Obsidian are read-only copies
-- **End-to-end encryption support** — encrypted notes are decrypted locally using your credentials
+- **End-to-end encryption support** — encrypted notes are decrypted locally using your credentials (**stored as plaintext in Obsidian**)
 - **Automatic sync** — configurable interval (default: every 5 minutes)
 - **Manual sync** — via ribbon icon or command palette
 - **Frontmatter metadata** — each note includes `satset_id`, `created_at`, `updated_at`, tags, pinned/archived status
@@ -52,13 +52,21 @@ Your notes will appear in the `Satset/` folder (configurable in settings).
 ## ⚙️ Settings
 
 | Setting | Description | Default |
-|---------|-------------|---------|
+| :--- | :--- | :--- |
 | **Sync Folder** | Vault folder for synced notes | `Satset` |
 | **Auto-sync Interval** | Minutes between auto-syncs (0 = manual only) | `5` |
 | **Include Archived** | Also sync archived notes | `false` |
 | **Force Full Resync** | Clear sync history and re-download everything | — |
 
 ## 🔐 Encryption & Privacy
+
+> [!WARNING]
+> **Important Security Note:**  
+> When you sync notes to Obsidian using this plugin, they are **decrypted** and stored as standard Markdown (`.md`) files in your vault.  
+>
+> **These files are NOT encrypted at rest by the plugin.**  
+>
+> If you require security for your local notes, you **must** use full-disk encryption (e.g., BitLocker, FileVault, LUKS) or an encrypted container (e.g., VeraCrypt) for your Obsidian vault.
 
 - All notes in Satset are encrypted using **AES-GCM 256-bit** with **PBKDF2** key derivation
 - The decryption key is derived locally from your credentials — it never leaves your device
@@ -67,7 +75,7 @@ Your notes will appear in the `Satset/` folder (configurable in settings).
 
 ## 🏗 How It Works
 
-```
+```text
 Satset Web App → Supabase (encrypted) → Obsidian Plugin (decrypt locally) → Markdown files
 ```
 
