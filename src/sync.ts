@@ -340,9 +340,12 @@ export class SyncService {
 
                 // CONFLICT DETECTION:
                 // If we have a recorded hash, and local differs from it -> User edited local.
-                // If we don't have a record (legacy/first run), assume "dirty" if content looks different? 
-                // Creating a conflict copy is safer than losing data.
-                const isDirty = lastSyncedHash && localHash !== lastSyncedHash;
+                // If we don't have a record (Legacy/First Run):
+                //    SAFEGUARD: If local content differs from incoming server content, we MUST assume it might be valuable user edits.
+                //    We treat it as dirty to prevent data loss. Yes, this backups "just old" files too, but safety first.
+                const isDirty = lastSyncedHash
+                    ? localHash !== lastSyncedHash
+                    : localHash !== serverHash; // Fallback: if local != incoming, backup logic triggers.
 
                 if (isDirty) {
                     // Conflict! Backup local file.
@@ -350,11 +353,21 @@ export class SyncService {
                     const conflictFilename = `${existingFile.basename} (Conflict ${timestamp}).md`;
                     const conflictPath = normalizePath(`${existingFile.parent?.path}/${conflictFilename}`);
 
-                    // Rename current logic file to conflict name
+                    // 1. Rename current file to conflict name
                     await vault.rename(existingFile, conflictPath);
                     new Notice(`⚠️ Conflict detected: ${existingFile.basename}. \nLocal changes backed up to "${conflictFilename}".`);
 
-                    // Now simple-create the new file at the original expected path (or new title path)
+                    // 2. STRIP satset_id to prevent index collision in future syncs
+                    // We modify the conflict file we just renamed
+                    const conflictFile = vault.getAbstractFileByPath(conflictPath);
+                    if (conflictFile instanceof TFile) {
+                        let conflictContent = await vault.read(conflictFile);
+                        // Rename the key so it's not picked up by buildIdIndex
+                        conflictContent = conflictContent.replace(/^satset_id:/m, "satset_conflict_of:");
+                        await vault.modify(conflictFile, conflictContent);
+                    }
+
+                    // 3. Create the new file at the original expected path
                     // We need to re-determine target path because we just moved the file
                     let targetPath = normalizePath(`${folderPath}/${title}.md`);
                     targetPath = await this.getUniquePath(targetPath, note.id);
