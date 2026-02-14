@@ -8,6 +8,8 @@
  * handles renames, and supports incremental sync.
  *
  * Retry: HTTP requests use exponential backoff (3 retries) for transient errors.
+ *
+ * Soft Delete: Notes deleted on the web are moved to _archived/ subfolder locally.
  */
 import { Notice, Vault, TFile, TFolder, normalizePath, requestUrl, RequestUrlParam } from "obsidian";
 import type SatsetSyncPlugin from "./main";
@@ -39,6 +41,11 @@ interface ConfigResponse {
     userId: string;
     email: string;
     encryptionSalt: string | null;
+}
+
+interface DeletedNote {
+    note_id: string;
+    deleted_at: string;
 }
 
 // ── Crypto Helpers ──
@@ -301,12 +308,6 @@ export class SyncService {
             const result = await this.request(`/${query}`, { method: "GET" }) as { notes?: SatsetNote[] };
             const notes: SatsetNote[] = result.notes || [];
 
-            if (notes.length === 0) {
-                this.consecutiveFailures = 0;
-                new Notice("✅ Already up to date.");
-                return;
-            }
-
             await this.ensureFolder(syncFolder);
 
             let created = 0;
@@ -350,6 +351,10 @@ export class SyncService {
                 }
             }
 
+            // ── Soft Delete Sync ──
+            // After syncing notes, check for deletions and archive locally
+            const archived = await this.syncDeletions(syncFolder, lastSyncTime);
+
             this.plugin.settings.lastSyncTime = maxUpdatedAt;
             await this.plugin.saveSettings();
 
@@ -361,14 +366,110 @@ export class SyncService {
             if (updated > 0) parts.push(`${updated} updated`);
             if (renamed > 0) parts.push(`${renamed} renamed`);
             if (skipped > 0) parts.push(`${skipped} skipped`);
+            if (archived > 0) parts.push(`${archived} archived`);
             if (decryptFailed > 0) parts.push(`${decryptFailed} errors`);
 
-            new Notice(`✅ Sync complete: ${parts.join(", ") || "no changes"}`);
+            if (notes.length === 0 && archived === 0) {
+                new Notice("✅ Already up to date.");
+            } else {
+                new Notice(`✅ Sync complete: ${parts.join(", ") || "no changes"}`);
+            }
         } catch (error: unknown) {
             this.consecutiveFailures++;
             const message = error instanceof Error ? error.message : String(error);
             console.error(`[Satset Sync] Sync error (failure #${this.consecutiveFailures}):`, error);
             new Notice(`❌ Sync error: ${message}`);
+        }
+    }
+
+    /**
+     * Sync deletions: query the /deleted endpoint and archive local files.
+     *
+     * Strategy: SOFT DELETE (move to _archived/ subfolder).
+     * - Files are moved, not deleted, so the user can recover them.
+     * - Frontmatter `satset_id` is renamed to `satset_deleted_from` to prevent
+     *   the archived file from being picked up by future buildIdIndex scans.
+     * - syncedFiles tracking is cleaned up for archived notes.
+     *
+     * This method is non-fatal: if the /deleted endpoint doesn't exist yet
+     * (e.g. migration not applied), it silently returns 0.
+     */
+    private async syncDeletions(syncFolder: string, lastSyncTime: string): Promise<number> {
+        try {
+            let query = "/deleted";
+            if (lastSyncTime) {
+                query += `?since=${encodeURIComponent(lastSyncTime)}`;
+            }
+
+            const result = await this.request(query, { method: "GET" }) as {
+                deleted?: DeletedNote[];
+            };
+            const deletedNotes = result.deleted || [];
+
+            if (deletedNotes.length === 0) return 0;
+
+            const archiveFolder = normalizePath(`${syncFolder}/_archived`);
+            await this.ensureFolder(archiveFolder);
+
+            const vault: Vault = this.plugin.app.vault;
+            let archived = 0;
+
+            for (const del of deletedNotes) {
+                const existingPath = this.idToFileMap.get(del.note_id);
+                if (!existingPath) continue; // File not in vault, skip
+
+                const file = vault.getAbstractFileByPath(existingPath);
+                if (!(file instanceof TFile)) continue;
+
+                try {
+                    // Determine unique archive path
+                    let archivePath = normalizePath(`${archiveFolder}/${file.name}`);
+                    archivePath = await this.getUniqueArchivePath(archivePath);
+
+                    // 1. Move file to _archived/
+                    await vault.rename(file, archivePath);
+
+                    // 2. Strip satset_id to prevent re-indexing
+                    const archivedFile = vault.getAbstractFileByPath(archivePath);
+                    if (archivedFile instanceof TFile) {
+                        let content = await vault.read(archivedFile);
+                        content = content.replace(/^satset_id:/m, "satset_deleted_from:");
+                        // Add deletion timestamp to frontmatter
+                        content = content.replace(
+                            /^---\n/m,
+                            `---\ndeleted_at: "${del.deleted_at}"\n`
+                        );
+                        await vault.modify(archivedFile, content);
+                    }
+
+                    // 3. Clean up tracking
+                    this.idToFileMap.delete(del.note_id);
+                    delete this.plugin.settings.syncedFiles[del.note_id];
+
+                    archived++;
+                    console.log(
+                        `[Satset Sync] Archived deleted note: ${existingPath} → ${archivePath}`
+                    );
+                } catch (err) {
+                    console.warn(
+                        `[Satset Sync] Failed to archive ${existingPath}:`,
+                        err
+                    );
+                }
+            }
+
+            if (archived > 0) {
+                new Notice(
+                    `📦 ${archived} deleted note${archived > 1 ? "s" : ""} archived to _archived/ folder.`
+                );
+                await this.plugin.saveSettings();
+            }
+
+            return archived;
+        } catch (error) {
+            // Non-fatal: /deleted endpoint might not exist yet (migration not applied)
+            console.warn("[Satset Sync] Deletion sync skipped:", error);
+            return 0;
         }
     }
 
@@ -403,10 +504,8 @@ export class SyncService {
                 const existingContent = await vault.read(existingFile);
 
                 // Check if we need to update at all (server updated_at vs local updated_at)
-                // Note: We still check updated_at to skip unnecessary writes if server hasn't changed
                 const existingUpdatedAt = this.extractFrontmatterValue(existingContent, "updated_at");
                 if (existingUpdatedAt && existingUpdatedAt >= note.updated_at) {
-                    // Update our hash record just in case (e.g. first sync after update)
                     if (!this.plugin.settings.syncedFiles[note.id]) {
                         const localHash = await this.computeBodyHash(existingContent);
                         this.plugin.settings.syncedFiles[note.id] = localHash;
@@ -418,14 +517,10 @@ export class SyncService {
                 const localHash = await this.computeBodyHash(existingContent);
                 const lastSyncedHash = this.plugin.settings.syncedFiles[note.id];
 
-                // CONFLICT DETECTION:
-                // If we have a recorded hash, and local differs from it -> User edited local.
-                // If we don't have a record (Legacy/First Run):
-                //    SAFEGUARD: If local content differs from incoming server content, we MUST assume it might be valuable user edits.
-                //    We treat it as dirty to prevent data loss. Yes, this backups "just old" files too, but safety first.
+                // CONFLICT DETECTION
                 const isDirty = lastSyncedHash
                     ? localHash !== lastSyncedHash
-                    : localHash !== serverHash; // Fallback: if local != incoming, backup logic triggers.
+                    : localHash !== serverHash;
 
                 if (isDirty) {
                     // Conflict! Backup local file.
@@ -433,22 +528,16 @@ export class SyncService {
                     const conflictFilename = `${existingFile.basename} (Conflict ${timestamp}).md`;
                     const conflictPath = normalizePath(`${existingFile.parent?.path}/${conflictFilename}`);
 
-                    // 1. Rename current file to conflict name
                     await vault.rename(existingFile, conflictPath);
                     new Notice(`⚠️ Conflict detected: ${existingFile.basename}. \nLocal changes backed up to "${conflictFilename}".`);
 
-                    // 2. STRIP satset_id to prevent index collision in future syncs
-                    // We modify the conflict file we just renamed
                     const conflictFile = vault.getAbstractFileByPath(conflictPath);
                     if (conflictFile instanceof TFile) {
                         let conflictContent = await vault.read(conflictFile);
-                        // Rename the key so it's not picked up by buildIdIndex
                         conflictContent = conflictContent.replace(/^satset_id:/m, "satset_conflict_of:");
                         await vault.modify(conflictFile, conflictContent);
                     }
 
-                    // 3. Create the new file at the original expected path
-                    // We need to re-determine target path because we just moved the file
                     let targetPath = normalizePath(`${folderPath}/${title}.md`);
                     targetPath = await this.getUniquePath(targetPath, note.id);
 
@@ -458,12 +547,9 @@ export class SyncService {
                     return "updated";
                 }
 
-                // If not dirty (or no local changes), we can safely overwrite.
-
-                // Construct ideal path from current title
+                // Not dirty — safe to overwrite
                 let targetPath = normalizePath(`${folderPath}/${title}.md`);
 
-                // Check for rename
                 if (existingFile.path !== targetPath) {
                     targetPath = await this.getUniquePath(targetPath, note.id);
                     try {
@@ -483,14 +569,13 @@ export class SyncService {
                     }
                 }
 
-                // Same filename, just update content
                 await vault.modify(existingFile, content);
                 this.plugin.settings.syncedFiles[note.id] = serverHash;
                 return "updated";
             }
         }
 
-        // Step 2: New file (or not found in index)
+        // New file
         let targetPath = normalizePath(`${folderPath}/${title}.md`);
         targetPath = await this.getUniquePath(targetPath, note.id);
 
@@ -512,16 +597,13 @@ export class SyncService {
         while (true) {
             const file = vault.getAbstractFileByPath(candidatePath);
             if (!file) {
-                // Path is free!
                 return candidatePath;
             }
 
-            // File exists. Does it belong to THIS note?
             if (file instanceof TFile) {
                 try {
                     const content = await vault.cachedRead(file);
                     const existingId = this.extractFrontmatterValue(content, "satset_id");
-
                     if (existingId === noteId) {
                         return candidatePath;
                     }
@@ -530,14 +612,32 @@ export class SyncService {
                 }
             }
 
-            // Collision! Append counter.
             const extIndex = basePath.lastIndexOf(".");
             const base = extIndex > -1 ? basePath.substring(0, extIndex) : basePath;
             const ext = extIndex > -1 ? basePath.substring(extIndex) : "";
-
             candidatePath = `${base} (${counter})${ext}`;
             counter++;
         }
+    }
+
+    /**
+     * Generates a unique archive path by appending (1), (2), etc.
+     * Simpler than getUniquePath since we don't check satset_id.
+     */
+    private async getUniqueArchivePath(basePath: string): Promise<string> {
+        const vault: Vault = this.plugin.app.vault;
+        let candidatePath = basePath;
+        let counter = 1;
+
+        while (vault.getAbstractFileByPath(candidatePath)) {
+            const extIndex = basePath.lastIndexOf(".");
+            const base = extIndex > -1 ? basePath.substring(0, extIndex) : basePath;
+            const ext = extIndex > -1 ? basePath.substring(extIndex) : "";
+            candidatePath = `${base} (${counter})${ext}`;
+            counter++;
+        }
+
+        return candidatePath;
     }
 
     private noteToMarkdown(note: SatsetNote): string {
@@ -581,23 +681,13 @@ export class SyncService {
         }
     }
 
-    /**
-     * Extracts the body of the note, excluding the frontmatter.
-     * Robustly handles different frontmatter formats.
-     */
     private extractBody(content: string): string {
-        // Match content after the second "---" delimiter
         const match = content.match(/^---\n[\s\S]*?\n---\n([\s\S]*)$/);
         return match ? match[1] : content;
     }
 
-    /**
-     * Computes SHA-256 hash of the normalized note body.
-     * Normalizes line endings to \n to ensure cross-platform consistency.
-     */
     private async computeBodyHash(content: string): Promise<string> {
         const body = this.extractBody(content);
-        // Normalize line endings to \n
         const normalized = body.replace(/\r\n/g, "\n");
         const encoder = new TextEncoder();
         const data = encoder.encode(normalized);
