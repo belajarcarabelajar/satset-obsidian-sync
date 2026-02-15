@@ -21,8 +21,10 @@ import type SatsetSyncPlugin from "./main";
 const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Iml4dmJzZXh1anhkYmJ2enZteWJqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDk5Mzg4MDAsImV4cCI6MjA2NTUxNDgwMH0.CYpokPpeceFYzh9gMh-ymGYte9iCWcNamCCIc56Fh1I";
 
 // ── Encryption Constants (must match Satset web app) ──
-const ENCRYPTION_VERSION = "v1";
-const PBKDF2_ITERATIONS = 100000;
+const ENCRYPTION_VERSION_V1 = "v1";
+const ENCRYPTION_VERSION_V2 = "v2";
+const PBKDF2_ITERATIONS_V1 = 100000;
+const PBKDF2_ITERATIONS_V2 = 600000;
 const KEY_LENGTH = 256;
 
 // ── Retry Constants ──
@@ -54,6 +56,8 @@ interface DeletedNote {
     deleted_at: string;
 }
 
+type Keyring = Record<string, CryptoKey>;
+
 // ── Crypto Helpers ──
 function base64ToArrayBuffer(base64: string): ArrayBuffer {
     const binary = atob(base64);
@@ -64,7 +68,7 @@ function base64ToArrayBuffer(base64: string): ArrayBuffer {
     return bytes.buffer;
 }
 
-async function deriveEncryptionKey(passphrase: string, salt: Uint8Array): Promise<CryptoKey> {
+async function deriveEncryptionKey(passphrase: string, salt: Uint8Array, iterations: number): Promise<CryptoKey> {
     const encoder = new TextEncoder();
     const keyMaterial = await crypto.subtle.importKey(
         "raw",
@@ -74,7 +78,7 @@ async function deriveEncryptionKey(passphrase: string, salt: Uint8Array): Promis
         ["deriveBits", "deriveKey"]
     );
     return crypto.subtle.deriveKey(
-        { name: "PBKDF2", salt: salt as BufferSource, iterations: PBKDF2_ITERATIONS, hash: "SHA-256" },
+        { name: "PBKDF2", salt: salt as BufferSource, iterations, hash: "SHA-256" },
         keyMaterial,
         { name: "AES-GCM", length: KEY_LENGTH },
         false,
@@ -82,7 +86,7 @@ async function deriveEncryptionKey(passphrase: string, salt: Uint8Array): Promis
     );
 }
 
-async function decryptText(encrypted: string, key: CryptoKey): Promise<string> {
+async function decryptText(encrypted: string, keyring: Keyring): Promise<string> {
     if (!encrypted) return encrypted;
     if (!encrypted.includes("|")) return encrypted;
 
@@ -90,7 +94,9 @@ async function decryptText(encrypted: string, key: CryptoKey): Promise<string> {
     if (parts.length !== 4) throw new Error("Invalid encrypted format");
 
     const [version, , ivB64, ciphertextB64] = parts;
-    if (version !== ENCRYPTION_VERSION) throw new Error(`Unsupported encryption version: ${version}`);
+    const key = keyring[version];
+
+    if (!key) throw new Error(`No decryption key available for version: ${version}`);
 
     const iv = new Uint8Array(base64ToArrayBuffer(ivB64));
     const ciphertext = new Uint8Array(base64ToArrayBuffer(ciphertextB64));
@@ -102,7 +108,7 @@ async function decryptText(encrypted: string, key: CryptoKey): Promise<string> {
 // ── Main Service ──
 export class SyncService {
     private plugin: SatsetSyncPlugin;
-    private encryptionKey: CryptoKey | null = null;
+    private keyring: Keyring | null = null; // Stores { v1: Key, v2: Key }
 
     // In-memory index: satset_id -> file path (built on each sync)
     private idToFileMap: Map<string, string> = new Map();
@@ -213,7 +219,7 @@ export class SyncService {
         );
     }
 
-    /** Connect using API Key: fetch config and derive encryption key. */
+    /** Connect using API Key: fetch config and derive encryption keys. */
     async connect(): Promise<boolean> {
         try {
             const config = await this.request("/config", { method: "GET" }) as ConfigResponse;
@@ -222,15 +228,25 @@ export class SyncService {
             this.plugin.settings.email = config.email;
             await this.plugin.saveSettings();
 
-            // Derive encryption key if salt is available
+            // Derive encryption keys if salt is available
             if (config.encryptionSalt) {
                 const salt = new Uint8Array(base64ToArrayBuffer(config.encryptionSalt));
                 const passphrase = `${config.userId}:${config.email}`;
-                this.encryptionKey = await deriveEncryptionKey(passphrase, salt);
+
+                // Derive both V1 and V2 keys for backward compatibility
+                const [keyV1, keyV2] = await Promise.all([
+                    deriveEncryptionKey(passphrase, salt, PBKDF2_ITERATIONS_V1),
+                    deriveEncryptionKey(passphrase, salt, PBKDF2_ITERATIONS_V2)
+                ]);
+
+                this.keyring = {
+                    [ENCRYPTION_VERSION_V1]: keyV1,
+                    [ENCRYPTION_VERSION_V2]: keyV2
+                };
             } else {
                 console.warn("[Satset Sync] No encryption salt found. Encrypted notes will be skipped.");
                 new Notice("⚠️ No encryption salt. Encrypted notes will be skipped.");
-                this.encryptionKey = null;
+                this.keyring = null;
             }
 
             this.consecutiveFailures = 0;
@@ -250,7 +266,7 @@ export class SyncService {
         this.plugin.settings.apiKey = "";
         this.plugin.settings.userId = "";
         this.plugin.settings.email = "";
-        this.encryptionKey = null;
+        this.keyring = null;
         this.consecutiveFailures = 0;
         await this.plugin.saveSettings();
         new Notice("👋 Disconnected.");
@@ -291,14 +307,23 @@ export class SyncService {
             return;
         }
 
-        // Ensure encryption key is ready
-        if (!this.encryptionKey && this.plugin.settings.userId) {
+        // Ensure keyring is ready
+        if (!this.keyring && this.plugin.settings.userId) {
             try {
                 const config = await this.request("/config", { method: "GET" }) as ConfigResponse;
                 if (config.encryptionSalt) {
                     const salt = new Uint8Array(base64ToArrayBuffer(config.encryptionSalt));
                     const passphrase = `${config.userId}:${config.email}`;
-                    this.encryptionKey = await deriveEncryptionKey(passphrase, salt);
+
+                    const [keyV1, keyV2] = await Promise.all([
+                        deriveEncryptionKey(passphrase, salt, PBKDF2_ITERATIONS_V1),
+                        deriveEncryptionKey(passphrase, salt, PBKDF2_ITERATIONS_V2)
+                    ]);
+
+                    this.keyring = {
+                        [ENCRYPTION_VERSION_V1]: keyV1,
+                        [ENCRYPTION_VERSION_V2]: keyV2
+                    };
                 }
             } catch {
                 // Non-fatal; encrypted notes will be skipped
@@ -330,17 +355,17 @@ export class SyncService {
 
             for (const note of notes) {
                 // Decrypt if needed
-                if (note.encrypted && this.encryptionKey) {
+                if (note.encrypted && this.keyring) {
                     try {
-                        note.title = await decryptText(note.title, this.encryptionKey);
-                        note.content = note.content ? await decryptText(note.content, this.encryptionKey) : "";
+                        note.title = await decryptText(note.title, this.keyring);
+                        note.content = note.content ? await decryptText(note.content, this.keyring) : "";
                     } catch (err: unknown) {
                         console.warn(`[Satset Sync] Decrypt failed for ${note.id}:`, err);
                         note.title = `Decryption failed ${note.id.substring(0, 8)}`;
                         note.content = `> [!ERROR] Decryption failed\n> Could not decrypt this note. It might use a different key or be corrupted.\n\nRaw content length: ${note.content?.length ?? 0}`;
                         decryptFailed++;
                     }
-                } else if (note.encrypted && !this.encryptionKey) {
+                } else if (note.encrypted && !this.keyring) {
                     // Skip if we can't decrypt at all (no key derived)
                     skipped++;
                     continue;
