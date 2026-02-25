@@ -1,10 +1,10 @@
 {
     "id": "satset-sync",
     "name": "Satset Sync",
-    "version": "1.0.2",
+    "version": "1.2.0",
     "minAppVersion": "0.15.0",
     "description": "Sync your Satset notes with automatic decryption.",
     "author": "Satset Note-taking",
-    "authorUrl": "https://satset-notetaking.lovable.app",
+    "authorUrl": "https://satset-notetaking.pages.dev",
     "isDesktopOnly": false
 }

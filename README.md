@@ -1,6 +1,6 @@
 # Satset Sync for Obsidian
 
-Synchronize your [Satset Note-taking](https://satset-notetaking.lovable.app) notes directly into your Obsidian vault — including **encrypted notes** with automatic decryption.
+Synchronize your [Satset Note-taking](https://satset-notetaking.pages.dev) notes directly into your Obsidian vault — including **encrypted notes** with automatic decryption.
 
 ## ✨ Features
 
@@ -43,11 +43,11 @@ Synchronize your [Satset Note-taking](https://satset-notetaking.lovable.app) not
 
 ### 1. Create a Satset Account
 
-If you don't have one, sign up at [satset-notetaking.lovable.app](https://satset-notetaking.lovable.app).
+If you don't have one, sign up at [satset-notetaking.pages.dev](https://satset-notetaking.pages.dev).
 
 ### 2. Get Your API Key
 
-1. Log in to [Satset Note-taking](https://satset-notetaking.lovable.app)
+1. Log in to [Satset Note-taking](https://satset-notetaking.pages.dev)
 2. Go to **Settings** → **API Keys**
 3. Generate a new API key and copy it
 
@@ -58,7 +58,7 @@ If you don't have one, sign up at [satset-notetaking.lovable.app](https://satset
 1. Open **Settings** → **Satset Sync**
 2. Paste your **API Key** into the API Key field
 3. Click **Connect**
-4. You should see **✅ Connected as your-email@example.com**
+4. You should see **✅ Connected as <your-email@example.com>**
 
 > **Note**: Your API key is stored locally in the plugin's `data.json` file. It is never sent to any third-party service.
 
@@ -116,6 +116,7 @@ Satset Web App → Supabase (encrypted) → Obsidian Plugin (decrypt locally) �
 **Cause**: The API key stored in `data.json` is invalid or outdated.
 
 **Fix**:
+
 1. Close Obsidian completely (check Task Manager / System Tray)
 2. Navigate to `<your-vault>/.obsidian/plugins/satset-sync/`
 3. Open `data.json` in a text editor
@@ -174,6 +175,6 @@ npm run dev
 
 ## 🔗 Links
 
-- [Satset Note-taking](https://satset-notetaking.lovable.app) — The web app
+- [Satset Note-taking](https://satset-notetaking.pages.dev) — The web app
 - [GitHub Repository](https://github.com/belajarcarabelajar/satset-obsidian-sync) — Source code & issues
 - [Security Overview](docs/SECURITY_OVERVIEW.md) — Detailed security documentation
