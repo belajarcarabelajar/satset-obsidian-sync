@@ -9,7 +9,7 @@
  *
  * Retry: HTTP requests use exponential backoff (3 retries) for transient errors.
  *
- * Soft Delete: Notes deleted on the web are moved to _archived/ subfolder locally.
+ * Soft Delete: Notes deleted on the web are moved to the local Obsidian trash.
  */
 import { Notice, Vault, TFile, TFolder, normalizePath, requestUrl, RequestUrlParam } from "obsidian";
 import type SatsetSyncPlugin from "./main";
@@ -388,7 +388,7 @@ export class SyncService {
             }
 
             // ── Soft Delete Sync ──
-            const archived = await this.syncDeletions(syncFolder, lastSyncTime);
+            const deletedCount = await this.syncDeletions(syncFolder, lastSyncTime);
 
             this.plugin.settings.lastSyncTime = maxUpdatedAt;
             await this.plugin.saveSettings();
@@ -401,10 +401,10 @@ export class SyncService {
             if (updated > 0) parts.push(`${updated} updated`);
             if (renamed > 0) parts.push(`${renamed} renamed`);
             if (skipped > 0) parts.push(`${skipped} skipped`);
-            if (archived > 0) parts.push(`${archived} archived`);
+            if (deletedCount > 0) parts.push(`${deletedCount} deleted`);
             if (decryptFailed > 0) parts.push(`${decryptFailed} errors`);
 
-            if (notes.length === 0 && archived === 0) {
+            if (notes.length === 0 && deletedCount === 0) {
                 new Notice("✅ Already up to date.");
             } else {
                 new Notice(`✅ Sync complete: ${parts.join(", ") || "no changes"}`);
@@ -418,7 +418,7 @@ export class SyncService {
     }
 
     /**
-     * Sync deletions: query the /deleted endpoint and archive local files.
+     * Sync deletions: query the /deleted endpoint and delete local files.
      */
     private async syncDeletions(syncFolder: string, lastSyncTime: string): Promise<number> {
         try {
@@ -434,11 +434,8 @@ export class SyncService {
 
             if (deletedNotes.length === 0) return 0;
 
-            const archiveFolder = normalizePath(`${syncFolder}/_archived`);
-            await this.ensureFolder(archiveFolder);
-
             const vault: Vault = this.plugin.app.vault;
-            let archived = 0;
+            let deletedCount = 0;
 
             for (const del of deletedNotes) {
                 const existingPath = this.idToFileMap.get(del.note_id);
@@ -448,45 +445,31 @@ export class SyncService {
                 if (!(file instanceof TFile)) continue;
 
                 try {
-                    let archivePath = normalizePath(`${archiveFolder}/${file.name}`);
-                    archivePath = await this.getUniqueArchivePath(archivePath);
-
-                    await vault.rename(file, archivePath);
-
-                    const archivedFile = vault.getAbstractFileByPath(archivePath);
-                    if (archivedFile instanceof TFile) {
-                        let content = await vault.read(archivedFile);
-                        content = content.replace(/^satset_id:/m, "satset_deleted_from:");
-                        content = content.replace(
-                            /^---\n/m,
-                            `---\ndeleted_at: "${del.deleted_at}"\n`
-                        );
-                        await vault.modify(archivedFile, content);
-                    }
+                    await vault.trash(file, true);
 
                     this.idToFileMap.delete(del.note_id);
                     delete this.plugin.settings.syncedFiles[del.note_id];
 
-                    archived++;
+                    deletedCount++;
                     console.debug(
-                        `[Satset Sync] Archived deleted note: ${existingPath} → ${archivePath}`
+                        `[Satset Sync] Deleted note: ${existingPath}`
                     );
                 } catch (err: unknown) {
                     console.warn(
-                        `[Satset Sync] Failed to archive ${existingPath}:`,
+                        `[Satset Sync] Failed to delete ${existingPath}:`,
                         err
                     );
                 }
             }
 
-            if (archived > 0) {
+            if (deletedCount > 0) {
                 new Notice(
-                    `📦 ${archived} deleted note${archived > 1 ? "s" : ""} archived to _archived/ folder.`
+                    `🗑️ ${deletedCount} deleted note${deletedCount > 1 ? "s" : ""} moved to trash.`
                 );
                 await this.plugin.saveSettings();
             }
 
-            return archived;
+            return deletedCount;
         } catch (error: unknown) {
             console.warn("[Satset Sync] Deletion sync skipped:", error);
             return 0;
@@ -616,22 +599,6 @@ export class SyncService {
             candidatePath = `${base} (${counter})${ext}`;
             counter++;
         }
-    }
-
-    private async getUniqueArchivePath(basePath: string): Promise<string> {
-        const vault: Vault = this.plugin.app.vault;
-        let candidatePath = basePath;
-        let counter = 1;
-
-        while (vault.getAbstractFileByPath(candidatePath)) {
-            const extIndex = basePath.lastIndexOf(".");
-            const base = extIndex > -1 ? basePath.substring(0, extIndex) : basePath;
-            const ext = extIndex > -1 ? basePath.substring(extIndex) : "";
-            candidatePath = `${base} (${counter})${ext}`;
-            counter++;
-        }
-
-        return candidatePath;
     }
 
     private noteToMarkdown(note: SatsetNote): string {
