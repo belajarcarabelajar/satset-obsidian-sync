@@ -6,5 +6,6 @@
     "description": "Sync your Satset notes with automatic decryption.",
     "author": "Satset Note-taking",
     "authorUrl": "https://satset-notetaking.pages.dev",
+    "fundingUrl": "https://satset-notetaking.pages.dev",
     "isDesktopOnly": false
 }

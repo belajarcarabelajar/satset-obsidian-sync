@@ -4,3 +4,7 @@
     color: var(--text-success);
     font-weight: bold;
 }
+
+.satset-api-key-input {
+    width: 100%;
+}

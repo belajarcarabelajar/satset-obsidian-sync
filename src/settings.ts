@@ -56,7 +56,9 @@ export class SatsetSyncSettingTab extends PluginSettingTab {
         const { containerEl } = this;
         containerEl.empty();
 
-        new Setting(containerEl).setName("Satset Sync settings").setHeading();
+        // Note: Obsidian guidelines discourage a top-level heading like "General" or
+        // "Settings" when there is only one logical group. We skip an umbrella heading
+        // and go straight to the meaningful section headings below.
 
         // --- Authentication Section ---
         new Setting(containerEl).setName("Authentication").setHeading();
@@ -100,7 +102,7 @@ export class SatsetSyncSettingTab extends PluginSettingTab {
                 .setDesc("Generate an API key from the Satset website (integrations page).")
                 .addText((text: TextComponent) => {
                     text.inputEl.type = "password";
-                    text.inputEl.style.width = "100%";
+                    text.inputEl.addClass("satset-api-key-input");
                     text
                         .setPlaceholder("satset_sk_...")
                         .setValue(this.plugin.settings.apiKey)
@@ -202,7 +204,7 @@ export class SatsetSyncSettingTab extends PluginSettingTab {
                             await this.plugin.syncService.syncNotes();
                             this.display();
                         } catch (e: unknown) {
-                            console.error("Sync failed:", e);
+                            console.error("[Satset Sync] Sync failed:", e);
                             button.setButtonText("Failed");
                         } finally {
                             button.setDisabled(false);
