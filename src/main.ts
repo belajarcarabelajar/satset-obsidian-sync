@@ -115,8 +115,8 @@ export default class SatsetSyncPlugin extends Plugin {
             void this.syncService.syncNotes();
         }, ms);
 
-        // Register the interval so Obsidian can clean it up
-        this.registerInterval(this.autoSyncInterval);
+        // Manual cleanup is handled in stopAutoSync/onunload
+        // this.registerInterval(this.autoSyncInterval);
     }
 
     /**

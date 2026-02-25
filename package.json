@@ -1,6 +1,6 @@
 {
     "name": "obsidian-satset-sync",
-    "version": "1.0.2",
+    "version": "1.3.0",
     "description": "Satset Sync plugin for Obsidian",
     "main": "main.js",
     "scripts": {
