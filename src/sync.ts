@@ -445,7 +445,7 @@ export class SyncService {
                 if (!(file instanceof TFile)) continue;
 
                 try {
-                    await vault.trash(file, true);
+                    await this.plugin.app.fileManager.trashFile(file);
 
                     this.idToFileMap.delete(del.note_id);
                     delete this.plugin.settings.syncedFiles[del.note_id];
