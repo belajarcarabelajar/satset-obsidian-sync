@@ -34,7 +34,7 @@ export interface SatsetSyncSettings {
 }
 
 export const DEFAULT_SETTINGS: SatsetSyncSettings = {
-    supabaseUrl: "https://ixvbsexujxdbbvzvmybj.supabase.co",
+    supabaseUrl: "https://api.belajarcarabelajar.com",
     apiKey: "",
     userId: "",
     email: "",
