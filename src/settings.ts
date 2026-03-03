@@ -120,7 +120,7 @@ export class SatsetSyncSettingTab extends PluginSettingTab {
                         .setCta()
                         .onClick(async () => {
                             if (!this.plugin.settings.apiKey) {
-                                new Notice("❌ Please enter an API key first.");
+                                new Notice("Please enter an API key first.");
                                 return;
                             }
                             button.setButtonText("Connecting...");
@@ -208,7 +208,7 @@ export class SatsetSyncSettingTab extends PluginSettingTab {
                             button.setButtonText("Failed");
                         } finally {
                             button.setDisabled(false);
-                            setTimeout(() => { if (button) button.setButtonText("Sync now") }, 2000);
+                            setTimeout(() => button.setButtonText("Sync now"), 2000);
                         }
                     })
             );

@@ -245,17 +245,17 @@ export class SyncService {
                 };
             } else {
                 console.warn("[Satset Sync] No encryption salt found. Encrypted notes will be skipped.");
-                new Notice("⚠️ No encryption salt. Encrypted notes will be skipped.");
+                new Notice("No encryption salt. Encrypted notes will be skipped.");
                 this.keyring = null;
             }
 
             this.consecutiveFailures = 0;
-            new Notice(`✅ Connected as ${config.email}`);
+            new Notice(`Connected as ${config.email}`);
             return true;
         } catch (error: unknown) {
             this.consecutiveFailures++;
             const message = error instanceof Error ? error.message : String(error);
-            new Notice(`❌ Connection failed: ${message}`);
+            new Notice(`Connection failed: ${message}`);
             console.error("[Satset Sync] Connection error:", error);
             return false;
         }
@@ -269,7 +269,7 @@ export class SyncService {
         this.keyring = null;
         this.consecutiveFailures = 0;
         await this.plugin.saveSettings();
-        new Notice("👋 Disconnected.");
+        new Notice("Disconnected.");
     }
 
     /** Build an index of satset_id -> filePath by scanning the sync folder. */
@@ -303,7 +303,7 @@ export class SyncService {
         const { apiKey, syncFolder, lastSyncTime } = this.plugin.settings;
 
         if (!apiKey) {
-            new Notice("⚠️ Please connect with an API key first.");
+            new Notice("Please connect with an API key first.");
             return;
         }
 
@@ -339,7 +339,7 @@ export class SyncService {
                 query += `?since=${encodeURIComponent(lastSyncTime)}`;
             }
 
-            new Notice("🔄 Syncing notes...");
+            new Notice("Syncing notes...");
 
             const result = await this.request(`/${query}`, { method: "GET" }) as { notes?: SatsetNote[] };
             const notes: SatsetNote[] = result.notes || [];
@@ -405,15 +405,15 @@ export class SyncService {
             if (decryptFailed > 0) parts.push(`${decryptFailed} errors`);
 
             if (notes.length === 0 && deletedCount === 0) {
-                new Notice("✅ Already up to date.");
+                new Notice("Already up to date.");
             } else {
-                new Notice(`✅ Sync complete: ${parts.join(", ") || "no changes"}`);
+                new Notice(`Sync complete: ${parts.join(", ") || "no changes"}`);
             }
         } catch (error: unknown) {
             this.consecutiveFailures++;
             const message = error instanceof Error ? error.message : String(error);
             console.error(`[Satset Sync] Sync error (failure #${this.consecutiveFailures}):`, error);
-            new Notice(`❌ Sync error: ${message}`);
+            new Notice(`Sync error: ${message}`);
         }
     }
 
@@ -464,7 +464,7 @@ export class SyncService {
 
             if (deletedCount > 0) {
                 new Notice(
-                    `🗑️ ${deletedCount} deleted note${deletedCount > 1 ? "s" : ""} moved to trash.`
+                    `${deletedCount} deleted note${deletedCount > 1 ? "s" : ""} moved to trash.`
                 );
                 await this.plugin.saveSettings();
             }
@@ -516,7 +516,7 @@ export class SyncService {
                     const conflictPath = normalizePath(`${existingFile.parent?.path}/${conflictFilename}`);
 
                     await vault.rename(existingFile, conflictPath);
-                    new Notice(`⚠️ Conflict detected: ${existingFile.basename}. \nLocal changes backed up to "${conflictFilename}".`);
+                    new Notice(`Conflict detected: ${existingFile.basename}. \nLocal changes backed up to "${conflictFilename}".`);
 
                     const conflictFile = vault.getAbstractFileByPath(conflictPath);
                     if (conflictFile instanceof TFile) {
