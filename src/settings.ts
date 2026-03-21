@@ -204,7 +204,7 @@ export class SatsetSyncSettingTab extends PluginSettingTab {
                             await this.plugin.syncService.syncNotes();
                             this.display();
                         } catch (e: unknown) {
-                            console.error("[Satset Sync] Sync failed:", e);
+                            console.log("[Satset Sync] Sync failed:", e);
                             button.setButtonText("Failed");
                         } finally {
                             button.setDisabled(false);

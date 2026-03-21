@@ -244,7 +244,7 @@ export class SyncService {
                     [ENCRYPTION_VERSION_V2]: keyV2
                 };
             } else {
-                console.warn("[Satset Sync] No encryption salt found. Encrypted notes will be skipped.");
+                console.log("[Satset Sync] No encryption salt found. Encrypted notes will be skipped.");
                 new Notice("No encryption salt. Encrypted notes will be skipped.");
                 this.keyring = null;
             }
@@ -256,7 +256,7 @@ export class SyncService {
             this.consecutiveFailures++;
             const message = error instanceof Error ? error.message : String(error);
             new Notice(`Connection failed: ${message}`);
-            console.error("[Satset Sync] Connection error:", error);
+            console.log("[Satset Sync] Connection error:", error);
             return false;
         }
     }
@@ -360,7 +360,7 @@ export class SyncService {
                         note.title = await decryptText(note.title, this.keyring);
                         note.content = note.content ? await decryptText(note.content, this.keyring) : "";
                     } catch (err: unknown) {
-                        console.warn(`[Satset Sync] Decrypt failed for ${note.id}:`, err);
+                        console.log(`[Satset Sync] Decrypt failed for ${note.id}:`, err);
                         note.title = `Decryption failed ${note.id.substring(0, 8)}`;
                         note.content = `> [!ERROR] Decryption failed\n> Could not decrypt this note. It might use a different key or be corrupted.\n\nRaw content length: ${note.content?.length ?? 0}`;
                         decryptFailed++;
@@ -412,7 +412,7 @@ export class SyncService {
         } catch (error: unknown) {
             this.consecutiveFailures++;
             const message = error instanceof Error ? error.message : String(error);
-            console.error(`[Satset Sync] Sync error (failure #${this.consecutiveFailures}):`, error);
+            console.log(`[Satset Sync] Sync error (failure #${this.consecutiveFailures}):`, error);
             new Notice(`Sync error: ${message}`);
         }
     }
@@ -455,7 +455,7 @@ export class SyncService {
                         `[Satset Sync] Deleted note: ${existingPath}`
                     );
                 } catch (err: unknown) {
-                    console.warn(
+                    console.log(
                         `[Satset Sync] Failed to delete ${existingPath}:`,
                         err
                     );
@@ -471,7 +471,7 @@ export class SyncService {
 
             return deletedCount;
         } catch (error: unknown) {
-            console.warn("[Satset Sync] Deletion sync skipped:", error);
+            console.log("[Satset Sync] Deletion sync skipped:", error);
             return 0;
         }
     }
@@ -548,7 +548,7 @@ export class SyncService {
                         this.plugin.settings.syncedFiles[note.id] = serverHash;
                         return "renamed";
                     } catch (err: unknown) {
-                        console.warn(`[Satset Sync] Rename failed for ${note.id}, updating in place:`, err);
+                        console.log(`[Satset Sync] Rename failed for ${note.id}, updating in place:`, err);
                         await vault.modify(existingFile, content);
                         this.plugin.settings.syncedFiles[note.id] = serverHash;
                         return "updated";
