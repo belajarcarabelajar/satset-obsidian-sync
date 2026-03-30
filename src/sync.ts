@@ -161,6 +161,7 @@ export class SyncService {
             try {
                 const response = await requestUrl({
                     url,
+                    throw: false,
                     ...options,
                     headers: {
                         "Content-Type": "application/json",
