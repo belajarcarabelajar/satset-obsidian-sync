@@ -335,16 +335,7 @@ export class SyncService {
             // Build the ID -> file path index
             await this.buildIdIndex(syncFolder);
 
-            let query = "";
-            if (lastSyncTime) {
-                query += `?since=${encodeURIComponent(lastSyncTime)}`;
-            }
-
             new Notice("Syncing notes...");
-
-            const result = await this.request(`/${query}`, { method: "GET" }) as { notes?: SatsetNote[] };
-            const notes: SatsetNote[] = result.notes || [];
-
             await this.ensureFolder(syncFolder);
 
             let created = 0;
@@ -353,38 +344,65 @@ export class SyncService {
             let renamed = 0;
             let decryptFailed = 0;
             let maxUpdatedAt = lastSyncTime;
+            
+            let hasMoreNotes = true;
+            let currentSince = lastSyncTime;
 
-            for (const note of notes) {
-                // Decrypt if needed
-                if (note.encrypted && this.keyring) {
-                    try {
-                        note.title = await decryptText(note.title, this.keyring);
-                        note.content = note.content ? await decryptText(note.content, this.keyring) : "";
-                    } catch (err: unknown) {
-                        console.log(`[Satset Sync] Decrypt failed for ${note.id}:`, err);
-                        note.title = `Decryption failed ${note.id.substring(0, 8)}`;
-                        note.content = `> [!ERROR] Decryption failed\n> Could not decrypt this note. It might use a different key or be corrupted.\n\nRaw content length: ${note.content?.length ?? 0}`;
-                        decryptFailed++;
+            while (hasMoreNotes) {
+                let query = "";
+                if (currentSince) {
+                    query += `?since=${encodeURIComponent(currentSince)}`;
+                }
+
+                const result = await this.request(`/${query}`, { method: "GET" }) as { notes?: SatsetNote[] };
+                const notes: SatsetNote[] = result.notes || [];
+
+                if (notes.length === 0) {
+                    break;
+                }
+
+                for (const note of notes) {
+                    // Decrypt if needed
+                    if (note.encrypted && this.keyring) {
+                        try {
+                            note.title = await decryptText(note.title, this.keyring);
+                            note.content = note.content ? await decryptText(note.content, this.keyring) : "";
+                        } catch (err: unknown) {
+                            console.log(`[Satset Sync] Decrypt failed for ${note.id}:`, err);
+                            note.title = `Decryption failed ${note.id.substring(0, 8)}`;
+                            note.content = `> [!ERROR] Decryption failed\n> Could not decrypt this note. It might use a different key or be corrupted.\n\nRaw content length: ${note.content?.length ?? 0}`;
+                            decryptFailed++;
+                        }
+                    } else if (note.encrypted && !this.keyring) {
+                        // Skip if we can't decrypt at all (no key derived)
+                        skipped++;
+                        continue;
                     }
-                } else if (note.encrypted && !this.keyring) {
-                    // Skip if we can't decrypt at all (no key derived)
-                    skipped++;
-                    continue;
+
+                    const syncResult = await this.writeNoteSmartSync(note, syncFolder);
+                    if (syncResult === "created") created++;
+                    else if (syncResult === "updated") updated++;
+                    else if (syncResult === "renamed") renamed++;
+                    else if (syncResult === "skipped") skipped++;
+
+                    if (note.updated_at > maxUpdatedAt) {
+                        maxUpdatedAt = note.updated_at;
+                    }
+
+                    // Batch save settings (every 10 items) to persist hashes
+                    if ((created + updated + renamed + skipped) % 10 === 0) {
+                        await this.plugin.saveSettings();
+                    }
                 }
-
-                const syncResult = await this.writeNoteSmartSync(note, syncFolder);
-                if (syncResult === "created") created++;
-                else if (syncResult === "updated") updated++;
-                else if (syncResult === "renamed") renamed++;
-                else if (syncResult === "skipped") skipped++;
-
-                if (note.updated_at > maxUpdatedAt) {
-                    maxUpdatedAt = note.updated_at;
-                }
-
-                // Batch save settings (every 10 items) to persist hashes
-                if ((created + updated + renamed + skipped) % 10 === 0) {
-                    await this.plugin.saveSettings();
+                
+                currentSince = maxUpdatedAt;
+                
+                // If we exactly received a typical max batch size, notify progress
+                if (notes.length >= 50) {
+                    new Notice(`Syncing... (processed ${created + updated + skipped + renamed} notes)`);
+                } else {
+                    // If it's less than 50 (or whatever edge limit), there are no more pages
+                    break; 
                 }
             }
 
@@ -405,7 +423,7 @@ export class SyncService {
             if (deletedCount > 0) parts.push(`${deletedCount} deleted`);
             if (decryptFailed > 0) parts.push(`${decryptFailed} errors`);
 
-            if (notes.length === 0 && deletedCount === 0) {
+            if (created === 0 && updated === 0 && renamed === 0 && skipped === 0 && deletedCount === 0) {
                 new Notice("Already up to date.");
             } else {
                 new Notice(`Sync complete: ${parts.join(", ") || "no changes"}`);
