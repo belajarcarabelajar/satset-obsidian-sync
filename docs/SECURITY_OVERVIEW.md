@@ -14,8 +14,9 @@ Satset uses a layered encryption approach:
                        │ HTTPS (TLS 1.2+)
                        ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│  Supabase Server                                                    │
-│  Notes stored as encrypted blobs — server cannot read content      │
+│  Satset Server (Supabase)                                           │
+│  Encrypted notes stored as AES-GCM blobs; the server also holds     │
+│  the key inputs (user ID, email, salt)                              │
 └──────────────────────┬──────────────────────────────────────────────┘
                        │ HTTPS (TLS 1.2+)
                        ▼
@@ -25,17 +26,19 @@ Satset uses a layered encryption approach:
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-## What "End-to-End Encryption" Covers
+## What the Encryption Covers
 
 | Segment | Encrypted? | Details |
 | :--- | :--- | :--- |
-| Satset Web App → Supabase | ✅ Yes | AES-GCM 256-bit + HTTPS |
-| Stored on Supabase server | ✅ Yes | Encrypted blobs; server has no decryption key |
-| Supabase → Obsidian Plugin | ✅ Yes | HTTPS (TLS 1.2+); payload still encrypted |
+| Satset Web App → Satset server | ✅ Yes | AES-GCM 256-bit + HTTPS |
+| Stored on Satset server (Supabase) | ⚠️ Partial | Encrypted notes are stored as AES-GCM blobs, but the server also holds the key inputs (user ID, email, salt) and could derive the key |
+| Satset server → Obsidian Plugin | ✅ Yes | HTTPS (TLS 1.2+); encrypted notes stay encrypted in the payload |
 | **Inside Obsidian vault (local)** | **❌ No** | **Plugin decrypts and writes plaintext Markdown** |
 
 > [!IMPORTANT]
-> The "end" in end-to-end encryption refers to the Satset application endpoints (web app and plugin). Once the plugin decrypts your notes, they exist as **standard plaintext files** on your local filesystem. The plugin does **not** re-encrypt them at rest.
+> This is **not** end-to-end encryption. The plugin derives the decryption key with PBKDF2 from the passphrase `<user ID>:<email>` and an encryption salt, and all three values come from the server's `/config` endpoint. The server side can therefore derive the same key. Encryption protects notes at rest on the server and HTTPS protects them in transit; it does not hide note content from the Satset server itself.
+>
+> Once the plugin decrypts your notes, they exist as **standard plaintext files** on your local filesystem. The plugin does **not** re-encrypt them at rest.
 
 ## Local Storage Security
 
@@ -82,7 +85,7 @@ The plugin creates and manages these files in your vault:
 ## Network Security
 
 - All communication uses **HTTPS (TLS 1.2+)**
-- The plugin communicates **only** with Supabase (`*.supabase.co`) — no third-party servers
+- The plugin sends requests **only** to the server in the **Supabase project URL** setting (default `https://api.belajarcarabelajar.com`); no third-party servers
 - No analytics, telemetry, or tracking is included in the plugin
 - API keys are sent via the `x-api-key` HTTP header, not in URL parameters
 
@@ -90,7 +93,8 @@ The plugin creates and manages these files in your vault:
 
 | Threat | Mitigated? | How |
 | :--- | :--- | :--- |
-| Server breach (Supabase) | ✅ | Notes stored as encrypted blobs |
+| Server breach (Supabase) | ⚠️ Partial | Notes are stored encrypted, but a breach that also exposes user IDs, emails and salts gives an attacker everything needed to derive the key |
+| Satset server operator reading notes | ❌ | The server holds all key inputs, so this is not end-to-end encryption |
 | Network interception (MITM) | ✅ | HTTPS/TLS encryption |
 | Local device theft (powered off) | ⚠️ Partial | Only if full-disk encryption is enabled |
 | Local device access (unlocked) | ❌ | Notes are plaintext; no additional protection |
