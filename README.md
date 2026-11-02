@@ -5,7 +5,7 @@ Synchronize your [Satset Note-taking](https://satset-notetaking.pages.dev) notes
 ## ✨ Features
 
 - **One-way sync** (Satset → Obsidian) — your notes in Obsidian are read-only copies
-- **End-to-end encryption support** — encrypted notes are decrypted locally using your credentials
+- **Encrypted notes support**: notes stored encrypted on the Satset server (AES-GCM 256) are decrypted locally by the plugin
 - **Automatic sync** — configurable interval (default: every 5 minutes)
 - **Manual sync** — via ribbon icon or command palette
 - **Frontmatter metadata** — each note includes `satset_id`, `created_at`, `updated_at`, tags, pinned/archived status
@@ -14,23 +14,17 @@ Synchronize your [Satset Note-taking](https://satset-notetaking.pages.dev) notes
 
 ## 📦 Installation
 
-### From Community Plugins (Recommended)
+### Manual Installation from GitHub Releases (Recommended)
 
-1. Open **Settings** → **Community Plugins** → **Browse**
-2. Search for **"Satset Sync"**
-3. Click **Install**, then **Enable**
-
-### Manual Installation
-
-1. Download the latest release from [GitHub Releases](https://github.com/belajarcarabelajar/satset-obsidian-sync/releases)
-2. Create the plugin folder (if it doesn't exist):  
-   `<your-vault>/.obsidian/plugins/satset-sync/`
-3. Copy these files into the folder:
+1. Open the [latest release](https://github.com/belajarcarabelajar/satset-obsidian-sync/releases/latest) and download these three files:
    - `main.js`
    - `manifest.json`
    - `styles.css`
+2. Create the plugin folder (if it doesn't exist). Its name is the plugin `id` from `manifest.json`, which is `satset-sync`:  
+   `<your-vault>/.obsidian/plugins/satset-sync/`
+3. Copy the three files into that folder
 4. Restart Obsidian
-5. Enable the plugin in **Settings** → **Community Plugins**
+5. Open **Settings** → **Community plugins**, turn on community plugins if asked, and enable **Satset Sync** under **Installed plugins**
 6. Go to **Settings** → **Satset Sync** and enter your **API Key** (see [Getting Started](#-getting-started))
 7. Click **Connect** and verify the status shows "Connected"
 
@@ -38,6 +32,10 @@ Synchronize your [Satset Note-taking](https://satset-notetaking.pages.dev) notes
 > The plugin stores its configuration in `data.json` inside the plugin folder.  
 > If you update the plugin files manually, the old `data.json` is preserved — which means **previously saved settings (including API keys) will persist**.  
 > If you experience authentication errors (e.g., 401) after an update, check that the `apiKey` value in `data.json` is correct, or delete `data.json` to reset all settings.
+
+### From Community Plugins (Pending Review)
+
+Satset Sync is pending review for the Obsidian Community Plugins directory, so it cannot be installed from **Browse** yet. Use the manual installation above until it is listed.
 
 ## 🚀 Getting Started
 
@@ -87,15 +85,15 @@ Your notes will appear in the `Satset/` folder (configurable in settings).
 >
 > **These files are NOT encrypted at rest by the plugin.**  
 >
-> "End-to-end encryption" in Satset applies to **transmission** (HTTPS) and **server-side storage** (AES-GCM 256-bit). Once notes reach your device, the plugin decrypts them and writes plaintext Markdown files.  
+> Satset's encryption covers **transmission** (HTTPS) and **server-side storage** (AES-GCM 256-bit). It is **not** end-to-end encryption: the Satset server holds everything needed to derive the decryption key (see below). Once notes reach your device, the plugin decrypts them and writes plaintext Markdown files.  
 >
 > If you require security for your local notes, you **must** use full-disk encryption (e.g., BitLocker, FileVault, LUKS) or an encrypted container (e.g., VeraCrypt) for your Obsidian vault.  
 >
 > For a detailed explanation, see [Security Overview](docs/SECURITY_OVERVIEW.md).
 
-- All notes in Satset are encrypted using **AES-GCM 256-bit** with **PBKDF2** key derivation
-- The decryption key is derived locally from your credentials — it never leaves your device
-- The plugin communicates directly with Supabase (the backend) using HTTPS
+- Encrypted notes are stored on the Satset server with **AES-GCM 256-bit**, using a key derived with **PBKDF2**
+- The plugin derives the decryption key locally from your user ID, email and an encryption salt, all returned by the server's `/config` endpoint. The plugin never sends the key, but the server has the same inputs and could derive it, so this does not hide your notes from the Satset server
+- The plugin sends requests only to the server in the **Supabase project URL** setting (default `https://api.belajarcarabelajar.com`), over HTTPS
 - No third-party servers or analytics are involved
 
 ## 🏗 How It Works
@@ -140,7 +138,7 @@ A small number of notes may have been created with a different encryption format
 
 - Ensure the folder is named exactly `satset-sync` (not `satset-obsidian-sync`)
 - Verify all three files (`main.js`, `manifest.json`, `styles.css`) are present
-- Restart Obsidian completely and enable the plugin in **Community Plugins**
+- Restart Obsidian completely and enable the plugin in **Settings** → **Community plugins** → **Installed plugins** (it is not listed under **Browse** yet)
 
 ## ❓ FAQ
 
