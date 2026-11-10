@@ -13,6 +13,7 @@ import {
     SatsetSyncSettings,
     DEFAULT_SETTINGS,
     SatsetSyncSettingTab,
+    clampSyncIntervalMinutes,
 } from "./settings";
 import { SyncService } from "./sync";
 
@@ -60,6 +61,10 @@ export default class SatsetSyncPlugin extends Plugin {
 
     async loadSettings() {
         this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+        // data.json can be edited by hand, so the stored interval is not trusted.
+        this.settings.syncIntervalMinutes = clampSyncIntervalMinutes(
+            this.settings.syncIntervalMinutes
+        );
     }
 
     async saveSettings() {
@@ -85,7 +90,8 @@ export default class SatsetSyncPlugin extends Plugin {
         const minutes = this.settings.syncIntervalMinutes;
         if (minutes <= 0 || !this.settings.apiKey) return;
 
-        const ms = minutes * 60 * 1000;
+        // setInterval takes a signed 32-bit delay; a larger value fires almost at once.
+        const ms = Math.min(minutes * 60 * 1000, 2147483647);
         this.backoffCycleCount = 0;
 
         this.autoSyncInterval = window.setInterval(() => {
@@ -112,7 +118,7 @@ export default class SatsetSyncPlugin extends Plugin {
                 this.backoffCycleCount = 0;
             }
 
-            void this.syncService.syncNotes();
+            void this.syncService.syncNotes({ silent: true });
         }, ms);
 
         // Manual cleanup is handled in stopAutoSync/onunload

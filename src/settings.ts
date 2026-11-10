@@ -44,6 +44,18 @@ export const DEFAULT_SETTINGS: SatsetSyncSettings = {
     syncedFiles: {},
 };
 
+/** Longest auto-sync interval accepted, in minutes (one day). */
+export const MAX_SYNC_INTERVAL_MINUTES = 1440;
+
+/**
+ * Normalize an auto-sync interval read from the settings field or data.json.
+ * Anything that is not a finite number becomes the default of 5 minutes.
+ */
+export function clampSyncIntervalMinutes(value: unknown): number {
+    if (typeof value !== "number" || !Number.isFinite(value)) return 5;
+    return Math.min(MAX_SYNC_INTERVAL_MINUTES, Math.max(0, Math.floor(value)));
+}
+
 export class SatsetSyncSettingTab extends PluginSettingTab {
     plugin: SatsetSyncPlugin;
 
@@ -73,13 +85,15 @@ export class SatsetSyncSettingTab extends PluginSettingTab {
 
             new Setting(containerEl)
                 .setName("Disconnect")
-                .setDesc("Remove API key and clear stored data.")
+                .setDesc("Remove API key and reset sync history. Notes already in your vault are kept.")
                 .addButton((button: ButtonComponent) =>
                     button
                         .setButtonText("Disconnect")
                         .setWarning()
                         .onClick(async () => {
                             await this.plugin.syncService.disconnect();
+                            // The API key is gone now, so this stops the timer.
+                            this.plugin.restartAutoSync();
                             this.display();
                         })
                 );
@@ -127,6 +141,8 @@ export class SatsetSyncSettingTab extends PluginSettingTab {
                             button.setDisabled(true);
                             const success = await this.plugin.syncService.connect();
                             if (success) {
+                                // At load the key was empty, so no timer exists yet.
+                                this.plugin.restartAutoSync();
                                 this.display();
                             } else {
                                 button.setButtonText("Connect");
@@ -161,7 +177,7 @@ export class SatsetSyncSettingTab extends PluginSettingTab {
                     .setValue(String(this.plugin.settings.syncIntervalMinutes))
                     .onChange(async (value: string) => {
                         const num = parseInt(value, 10);
-                        this.plugin.settings.syncIntervalMinutes = isNaN(num) ? 5 : Math.max(0, num);
+                        this.plugin.settings.syncIntervalMinutes = clampSyncIntervalMinutes(num);
                         await this.plugin.saveSettings();
                         this.plugin.restartAutoSync();
                     })
