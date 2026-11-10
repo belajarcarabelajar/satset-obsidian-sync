@@ -74,7 +74,6 @@ Your notes will appear in the `Satset/` folder (configurable in settings).
 | **API Key** | Your Satset API key for authentication | — |
 | **Sync Folder** | Vault folder for synced notes | `Satset` |
 | **Auto-sync Interval** | Minutes between auto-syncs (0 = manual only) | `5` |
-| **Include Archived** | Also sync archived notes | `false` |
 | **Force Full Resync** | Clear sync history and re-download everything | — |
 
 ## 🔐 Encryption & Privacy
@@ -130,7 +129,7 @@ A small number of notes may have been created with a different encryption format
 
 ### Sync Completes But Notes Are Missing
 
-- Check if the notes are archived — enable **Include Archived** in settings
+- Archived notes are synced too and carry `archived: true` in their frontmatter, so look for them in the sync folder
 - Try **Force Full Resync** to re-download all notes from scratch
 - Verify you are connected with the correct account
 
