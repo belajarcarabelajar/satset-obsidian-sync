@@ -13,6 +13,17 @@
  */
 import { Notice, Vault, TFile, TFolder, normalizePath, requestUrl, RequestUrlParam } from "obsidian";
 import type SatsetSyncPlugin from "./main";
+import {
+    PermanentError,
+    checkSupabaseUrl,
+    extractFrontmatterValue,
+    holdCursor,
+    isLaterTime,
+    isPermanentError,
+    renameFrontmatterKey,
+    sanitizeFilename,
+    yamlQuote,
+} from "./util";
 
 // ── Supabase Gateway Auth ──
 // The anon key is required by Supabase API gateway to route requests to Edge Functions.
@@ -30,6 +41,11 @@ const KEY_LENGTH = 256;
 // ── Retry Constants ──
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 1000; // 1s → 2s → 4s
+
+// ── Paging Constants ──
+// The Edge Function returns at most this many notes per page; a shorter page is the last one.
+const PAGE_SIZE = 50;
+const MAX_PAGES = 1000;
 
 // ── Interfaces ──
 interface SatsetNote {
@@ -113,6 +129,9 @@ export class SyncService {
     // In-memory index: satset_id -> file path (built on each sync)
     private idToFileMap: Map<string, string> = new Map();
 
+    /** True while a sync run is in progress; a second run would race on the same files. */
+    private syncing = false;
+
     /** Number of consecutive sync failures. Reset to 0 on successful sync. */
     public consecutiveFailures = 0;
 
@@ -138,11 +157,15 @@ export class SyncService {
      * - Retries up to MAX_RETRIES times for transient errors (5xx, network failures).
      * - Uses exponential backoff: 1s, 2s, 4s + random jitter (0–500ms).
      * - Does NOT retry client errors (4xx) as they indicate permanent failures.
+     * - Permanent failures are thrown as PermanentError; retry is decided by that flag, never by message text.
      */
     private async request(path: string, options: Partial<RequestUrlParam> = {}): Promise<unknown> {
         const { supabaseUrl, apiKey } = this.plugin.settings;
-        if (!supabaseUrl) throw new Error("Supabase URL not configured.");
-        if (!apiKey) throw new Error("API key not configured.");
+        if (!supabaseUrl) throw new PermanentError("Supabase URL not configured.");
+        if (!apiKey) throw new PermanentError("API key not configured.");
+        // Checked before any request so the API key never leaves over plain http.
+        const urlError = checkSupabaseUrl(supabaseUrl);
+        if (urlError) throw new PermanentError(urlError);
 
         const url = `${supabaseUrl}/functions/v1/sync-notes${path}`;
         let lastError: Error = new Error("Request failed");
@@ -174,22 +197,35 @@ export class SyncService {
 
                 // ── Success ──
                 if (response.status >= 200 && response.status < 300) {
-                    return response.json;
+                    try {
+                        return response.json;
+                    } catch {
+                        // response.json parses lazily and throws on a non-JSON body.
+                        throw new PermanentError(
+                            `Unexpected non-JSON response (HTTP ${response.status}).`
+                        );
+                    }
                 }
 
-                // ── Client errors (4xx) — permanent, do NOT retry ──
+                // ── Client errors (4xx): permanent, do NOT retry ──
                 if (response.status === 401) {
-                    throw new Error(
+                    throw new PermanentError(
                         "Invalid or expired API key. Please generate a new one from the website."
                     );
                 }
                 if (response.status === 403) {
-                    throw new Error(
+                    throw new PermanentError(
                         "API key has been revoked. Generate a new one from the website."
                     );
                 }
                 if (response.status >= 400 && response.status < 500) {
-                    throw new Error(`HTTP ${response.status}: ${JSON.stringify(response.json)}`);
+                    let body = "";
+                    try {
+                        body = (response.text || "").slice(0, 200);
+                    } catch {
+                        // Body unreadable; the status alone is reported.
+                    }
+                    throw new PermanentError(`HTTP ${response.status}: ${body}`);
                 }
 
                 // ── Server errors (5xx) — transient, retry ──
@@ -200,16 +236,12 @@ export class SyncService {
             } catch (error: unknown) {
                 const err = error instanceof Error ? error : new Error(String(error));
 
-                // If it's a non-retryable error we threw above, propagate immediately
-                if (
-                    err.message.includes("API key") ||
-                    err.message.includes("not configured") ||
-                    err.message.startsWith("HTTP 4")
-                ) {
+                // A permanent error thrown above propagates immediately
+                if (isPermanentError(err)) {
                     throw err;
                 }
 
-                // Network error or unexpected failure — retry
+                // Network error or unexpected failure: retry
                 lastError = err;
             }
         }
@@ -220,34 +252,56 @@ export class SyncService {
         );
     }
 
+    /**
+     * Fetch the account behind the API key, store its identity and derive the
+     * decryption keys. Shared by connect() and syncNotes() so that an API key
+     * alone is enough for encrypted notes. Leaves the keyring null when the
+     * account has no encryption salt.
+     */
+    private async ensureKeyring(): Promise<ConfigResponse> {
+        const config = await this.request("/config", { method: "GET" }) as ConfigResponse;
+
+        // Read before it is overwritten below, or an account change is never seen.
+        const previousUserId = this.plugin.settings.userId;
+        if (previousUserId && previousUserId !== config.userId) {
+            // Sync history belongs to the previous account; the new one starts from scratch.
+            this.plugin.settings.lastSyncTime = "";
+            this.plugin.settings.syncedFiles = {};
+        }
+
+        this.plugin.settings.userId = config.userId;
+        this.plugin.settings.email = config.email;
+        await this.plugin.saveSettings();
+
+        if (config.encryptionSalt) {
+            const salt = new Uint8Array(base64ToArrayBuffer(config.encryptionSalt));
+            const passphrase = `${config.userId}:${config.email}`;
+
+            // Derive both V1 and V2 keys for backward compatibility
+            const [keyV1, keyV2] = await Promise.all([
+                deriveEncryptionKey(passphrase, salt, PBKDF2_ITERATIONS_V1),
+                deriveEncryptionKey(passphrase, salt, PBKDF2_ITERATIONS_V2)
+            ]);
+
+            this.keyring = {
+                [ENCRYPTION_VERSION_V1]: keyV1,
+                [ENCRYPTION_VERSION_V2]: keyV2
+            };
+        } else {
+            this.keyring = null;
+        }
+
+        return config;
+    }
+
     /** Connect using API Key: fetch config and derive encryption keys. */
     async connect(): Promise<boolean> {
         try {
-            const config = await this.request("/config", { method: "GET" }) as ConfigResponse;
+            const config = await this.ensureKeyring();
 
-            this.plugin.settings.userId = config.userId;
-            this.plugin.settings.email = config.email;
-            await this.plugin.saveSettings();
-
-            // Derive encryption keys if salt is available
-            if (config.encryptionSalt) {
-                const salt = new Uint8Array(base64ToArrayBuffer(config.encryptionSalt));
-                const passphrase = `${config.userId}:${config.email}`;
-
-                // Derive both V1 and V2 keys for backward compatibility
-                const [keyV1, keyV2] = await Promise.all([
-                    deriveEncryptionKey(passphrase, salt, PBKDF2_ITERATIONS_V1),
-                    deriveEncryptionKey(passphrase, salt, PBKDF2_ITERATIONS_V2)
-                ]);
-
-                this.keyring = {
-                    [ENCRYPTION_VERSION_V1]: keyV1,
-                    [ENCRYPTION_VERSION_V2]: keyV2
-                };
-            } else {
+            if (!this.keyring) {
                 console.log("[Satset Sync] No encryption salt found. Encrypted notes will be skipped.");
                 new Notice("No encryption salt. Encrypted notes will be skipped.");
-                this.keyring = null;
             }
 
             this.consecutiveFailures = 0;
@@ -262,11 +316,15 @@ export class SyncService {
         }
     }
 
-    /** Disconnect: clear API Key and user data. */
+    /** Disconnect: clear API Key, user data and the sync history tied to the account. */
     async disconnect(): Promise<void> {
         this.plugin.settings.apiKey = "";
         this.plugin.settings.userId = "";
         this.plugin.settings.email = "";
+        // Without this reset the next account would start from the old cursor and miss its older notes.
+        this.plugin.settings.lastSyncTime = "";
+        this.plugin.settings.syncedFiles = {};
+        this.idToFileMap.clear();
         this.keyring = null;
         this.consecutiveFailures = 0;
         await this.plugin.saveSettings();
@@ -299,37 +357,42 @@ export class SyncService {
         }
     }
 
-    /** Main sync function. */
-    async syncNotes(): Promise<void> {
-        const { apiKey, syncFolder, lastSyncTime } = this.plugin.settings;
-
-        if (!apiKey) {
+    /**
+     * Main sync function. Only one run at a time: a second call returns at once.
+     * `silent` hides the "already running" Notice, for the auto-sync timer.
+     */
+    async syncNotes(options: { silent?: boolean } = {}): Promise<void> {
+        if (!this.plugin.settings.apiKey) {
             new Notice("Please connect with an API key first.");
             return;
         }
 
-        // Ensure keyring is ready
-        if (!this.keyring && this.plugin.settings.userId) {
+        if (this.syncing) {
+            if (!options.silent) new Notice("Sync already running");
+            return;
+        }
+
+        this.syncing = true;
+        try {
+            await this.runSync();
+        } finally {
+            this.syncing = false;
+        }
+    }
+
+    private async runSync(): Promise<void> {
+        // Ensure keyring is ready. An API key alone is enough; the user id is filled from /config.
+        if (!this.keyring) {
             try {
-                const config = await this.request("/config", { method: "GET" }) as ConfigResponse;
-                if (config.encryptionSalt) {
-                    const salt = new Uint8Array(base64ToArrayBuffer(config.encryptionSalt));
-                    const passphrase = `${config.userId}:${config.email}`;
-
-                    const [keyV1, keyV2] = await Promise.all([
-                        deriveEncryptionKey(passphrase, salt, PBKDF2_ITERATIONS_V1),
-                        deriveEncryptionKey(passphrase, salt, PBKDF2_ITERATIONS_V2)
-                    ]);
-
-                    this.keyring = {
-                        [ENCRYPTION_VERSION_V1]: keyV1,
-                        [ENCRYPTION_VERSION_V2]: keyV2
-                    };
-                }
-            } catch {
-                // Non-fatal; encrypted notes will be skipped
+                await this.ensureKeyring();
+            } catch (err: unknown) {
+                // Non-fatal; encrypted notes are held back and fetched again next sync
+                console.log("[Satset Sync] Could not prepare decryption keys:", err);
             }
         }
+
+        // Read after ensureKeyring: an account change resets the cursor there.
+        const { syncFolder, lastSyncTime } = this.plugin.settings;
 
         try {
             // Build the ID -> file path index
@@ -343,15 +406,31 @@ export class SyncService {
             let skipped = 0;
             let renamed = 0;
             let decryptFailed = 0;
-            let maxUpdatedAt = lastSyncTime;
-            
-            let hasMoreNotes = true;
-            let currentSince = lastSyncTime;
+            let failed = 0;
+            let held = 0;
 
-            while (hasMoreNotes) {
+            // Page cursor: largest updated_at seen, held notes included. It only drives paging.
+            // The saved cursor (lastSyncTime) is computed at the end and stays behind every held note.
+            let pageCursor = lastSyncTime;
+            const hold = { earliest: null as string | null, unparsable: false };
+            const holdNote = (note: SatsetNote): void => {
+                if (Number.isNaN(Date.parse(note.updated_at))) {
+                    hold.unparsable = true;
+                } else if (hold.earliest === null || isLaterTime(hold.earliest, note.updated_at)) {
+                    hold.earliest = note.updated_at;
+                }
+            };
+
+            for (let page = 1; ; page++) {
+                if (page > MAX_PAGES) {
+                    new Notice(`Sync paused after ${MAX_PAGES} pages. Run sync again to continue.`);
+                    break;
+                }
+
+                const since = pageCursor;
                 let query = "";
-                if (currentSince) {
-                    query += `?since=${encodeURIComponent(currentSince)}`;
+                if (since) {
+                    query += `?since=${encodeURIComponent(since)}`;
                 }
 
                 const result = await this.request(`/${query}`, { method: "GET" }) as { notes?: SatsetNote[] };
@@ -362,31 +441,41 @@ export class SyncService {
                 }
 
                 for (const note of notes) {
-                    // Decrypt if needed
-                    if (note.encrypted && this.keyring) {
-                        try {
-                            note.title = await decryptText(note.title, this.keyring);
-                            note.content = note.content ? await decryptText(note.content, this.keyring) : "";
-                        } catch (err: unknown) {
-                            console.log(`[Satset Sync] Decrypt failed for ${note.id}:`, err);
-                            note.title = `Decryption failed ${note.id.substring(0, 8)}`;
-                            note.content = `> [!ERROR] Decryption failed\n> Could not decrypt this note. It might use a different key or be corrupted.\n\nRaw content length: ${note.content?.length ?? 0}`;
-                            decryptFailed++;
-                        }
-                    } else if (note.encrypted && !this.keyring) {
-                        // Skip if we can't decrypt at all (no key derived)
-                        skipped++;
-                        continue;
+                    // Compared as times: the cursor and the server value may differ in format.
+                    if (isLaterTime(note.updated_at, pageCursor)) {
+                        pageCursor = note.updated_at;
                     }
 
-                    const syncResult = await this.writeNoteSmartSync(note, syncFolder);
-                    if (syncResult === "created") created++;
-                    else if (syncResult === "updated") updated++;
-                    else if (syncResult === "renamed") renamed++;
-                    else if (syncResult === "skipped") skipped++;
+                    // One bad note must not stop the others: it is counted, held and retried next sync.
+                    try {
+                        if (note.encrypted) {
+                            if (!this.keyring) {
+                                held++;
+                                holdNote(note);
+                                continue;
+                            }
+                            try {
+                                note.title = await decryptText(note.title, this.keyring);
+                                note.content = note.content ? await decryptText(note.content, this.keyring) : "";
+                            } catch (err: unknown) {
+                                // Nothing is written, so an existing local copy stays as it is.
+                                console.log(`[Satset Sync] Decrypt failed for ${note.id}:`, err);
+                                decryptFailed++;
+                                holdNote(note);
+                                continue;
+                            }
+                        }
 
-                    if (note.updated_at > maxUpdatedAt) {
-                        maxUpdatedAt = note.updated_at;
+                        const syncResult = await this.writeNoteSmartSync(note, syncFolder);
+                        if (syncResult === "created") created++;
+                        else if (syncResult === "updated") updated++;
+                        else if (syncResult === "renamed") renamed++;
+                        else if (syncResult === "skipped") skipped++;
+                    } catch (err: unknown) {
+                        console.log(`[Satset Sync] Could not write note ${note.id}:`, err);
+                        failed++;
+                        holdNote(note);
+                        continue;
                     }
 
                     // Batch save settings (every 10 items) to persist hashes
@@ -394,26 +483,44 @@ export class SyncService {
                         await this.plugin.saveSettings();
                     }
                 }
-                
-                currentSince = maxUpdatedAt;
-                
-                // If we exactly received a typical max batch size, notify progress
-                if (notes.length >= 50) {
-                    new Notice(`Syncing... (processed ${created + updated + skipped + renamed} notes)`);
-                } else {
-                    // If it's less than 50 (or whatever edge limit), there are no more pages
-                    break; 
+
+                if (notes.length < PAGE_SIZE) {
+                    // A short page is the last one
+                    break;
                 }
+
+                if (pageCursor === since) {
+                    // A full page that does not move the cursor would be fetched again forever.
+                    new Notice("Sync paused: the server returned the same page again. Run sync again later.");
+                    break;
+                }
+
+                new Notice(`Syncing... (processed ${created + updated + skipped + renamed} notes)`);
+            }
+
+            if (held > 0) {
+                new Notice(
+                    `${held} encrypted note${held > 1 ? "s" : ""} not synced: no decryption key. Will retry on the next sync.`
+                );
             }
 
             // ── Soft Delete Sync ──
-            const deletedCount = await this.syncDeletions(syncFolder, lastSyncTime);
+            const deletions = await this.syncDeletions(syncFolder, lastSyncTime);
 
-            this.plugin.settings.lastSyncTime = maxUpdatedAt;
+            if (deletions === null) {
+                // Keep the old cursor so the next run asks /deleted for the same window again.
+                // Notes fetched again are skipped by their updated_at.
+                new Notice("Deletion check failed, will retry");
+            } else if (!hold.unparsable) {
+                this.plugin.settings.lastSyncTime = holdCursor(pageCursor, hold.earliest);
+            }
             await this.plugin.saveSettings();
 
-            // ✅ Sync succeeded — reset failure counter
+            // Sync run finished: reset failure counter
             this.consecutiveFailures = 0;
+
+            const deletedCount = deletions ? deletions.deleted : 0;
+            const keptCount = deletions ? deletions.kept : 0;
 
             const parts: string[] = [];
             if (created > 0) parts.push(`${created} created`);
@@ -421,9 +528,12 @@ export class SyncService {
             if (renamed > 0) parts.push(`${renamed} renamed`);
             if (skipped > 0) parts.push(`${skipped} skipped`);
             if (deletedCount > 0) parts.push(`${deletedCount} deleted`);
+            if (keptCount > 0) parts.push(`${keptCount} kept as conflict`);
             if (decryptFailed > 0) parts.push(`${decryptFailed} errors`);
+            if (failed > 0) parts.push(`${failed} failed`);
+            if (held > 0) parts.push(`${held} held`);
 
-            if (created === 0 && updated === 0 && renamed === 0 && skipped === 0 && deletedCount === 0) {
+            if (parts.length === 0 && deletions !== null) {
                 new Notice("Already up to date.");
             } else {
                 new Notice(`Sync complete: ${parts.join(", ") || "no changes"}`);
@@ -438,8 +548,12 @@ export class SyncService {
 
     /**
      * Sync deletions: query the /deleted endpoint and delete local files.
+     * A file edited since its last sync is kept as a conflict copy instead.
+     * Returns null when the check itself failed, so the caller keeps its cursor.
      */
-    private async syncDeletions(syncFolder: string, lastSyncTime: string): Promise<number> {
+    private async syncDeletions(
+        syncFolder: string, lastSyncTime: string
+    ): Promise<{ deleted: number; kept: number } | null> {
         try {
             let query = "/deleted";
             if (lastSyncTime) {
@@ -451,10 +565,11 @@ export class SyncService {
             };
             const deletedNotes = result.deleted || [];
 
-            if (deletedNotes.length === 0) return 0;
+            if (deletedNotes.length === 0) return { deleted: 0, kept: 0 };
 
             const vault: Vault = this.plugin.app.vault;
             let deletedCount = 0;
+            let keptCount = 0;
 
             for (const del of deletedNotes) {
                 const existingPath = this.idToFileMap.get(del.note_id);
@@ -464,6 +579,19 @@ export class SyncService {
                 if (!(file instanceof TFile)) continue;
 
                 try {
+                    // A missing hash means the last synced state is unknown, so the file is kept too.
+                    const localHash = await this.computeBodyHash(await vault.read(file));
+                    if (localHash !== this.plugin.settings.syncedFiles[del.note_id]) {
+                        const basename = file.basename;
+                        const conflictFilename = await this.backupAsConflict(file);
+                        new Notice(`"${basename}" was deleted on the web but edited here. \nKept as "${conflictFilename}".`);
+
+                        this.idToFileMap.delete(del.note_id);
+                        delete this.plugin.settings.syncedFiles[del.note_id];
+                        keptCount++;
+                        continue;
+                    }
+
                     await this.plugin.app.fileManager.trashFile(file);
 
                     this.idToFileMap.delete(del.note_id);
@@ -485,14 +613,40 @@ export class SyncService {
                 new Notice(
                     `${deletedCount} deleted note${deletedCount > 1 ? "s" : ""} moved to trash.`
                 );
+            }
+            if (deletedCount > 0 || keptCount > 0) {
                 await this.plugin.saveSettings();
             }
 
-            return deletedCount;
+            return { deleted: deletedCount, kept: keptCount };
         } catch (error: unknown) {
-            console.log("[Satset Sync] Deletion sync skipped:", error);
-            return 0;
+            console.log("[Satset Sync] Deletion check failed:", error);
+            return null;
         }
+    }
+
+    /**
+     * Move a locally edited file aside as "<name> (Conflict <time>).md" and detach it
+     * from its note id, so the id index never maps the backup. Returns the new file name.
+     */
+    private async backupAsConflict(file: TFile): Promise<string> {
+        const vault: Vault = this.plugin.app.vault;
+        const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+        const conflictFilename = `${file.basename} (Conflict ${timestamp}).md`;
+        const conflictPath = normalizePath(`${file.parent?.path}/${conflictFilename}`);
+
+        await vault.rename(file, conflictPath);
+
+        const conflictFile = vault.getAbstractFileByPath(conflictPath);
+        if (conflictFile instanceof TFile) {
+            const conflictContent = await vault.read(conflictFile);
+            // Frontmatter only: a "satset_id:" line in the body is the user's text.
+            await vault.modify(
+                conflictFile,
+                renameFrontmatterKey(conflictContent, "satset_id", "satset_conflict_of")
+            );
+        }
+        return conflictFilename;
     }
 
     /**
@@ -530,19 +684,9 @@ export class SyncService {
                     : localHash !== serverHash;
 
                 if (isDirty) {
-                    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-                    const conflictFilename = `${existingFile.basename} (Conflict ${timestamp}).md`;
-                    const conflictPath = normalizePath(`${existingFile.parent?.path}/${conflictFilename}`);
-
-                    await vault.rename(existingFile, conflictPath);
-                    new Notice(`Conflict detected: ${existingFile.basename}. \nLocal changes backed up to "${conflictFilename}".`);
-
-                    const conflictFile = vault.getAbstractFileByPath(conflictPath);
-                    if (conflictFile instanceof TFile) {
-                        let conflictContent = await vault.read(conflictFile);
-                        conflictContent = conflictContent.replace(/^satset_id:/m, "satset_conflict_of:");
-                        await vault.modify(conflictFile, conflictContent);
-                    }
+                    const basename = existingFile.basename;
+                    const conflictFilename = await this.backupAsConflict(existingFile);
+                    new Notice(`Conflict detected: ${basename}. \nLocal changes backed up to "${conflictFilename}".`);
 
                     let targetPath = normalizePath(`${folderPath}/${title}.md`);
                     targetPath = await this.getUniquePath(targetPath, note.id);
@@ -622,13 +766,13 @@ export class SyncService {
 
     private noteToMarkdown(note: SatsetNote): string {
         const fm: string[] = ["---"];
-        fm.push(`satset_id: "${note.id}"`);
-        fm.push(`created_at: "${note.created_at}"`);
-        fm.push(`updated_at: "${note.updated_at}"`);
+        fm.push(`satset_id: ${yamlQuote(note.id)}`);
+        fm.push(`created_at: ${yamlQuote(note.created_at)}`);
+        fm.push(`updated_at: ${yamlQuote(note.updated_at)}`);
 
         if (note.labels && note.labels.length > 0) {
             fm.push("tags:");
-            for (const label of note.labels) fm.push(`  - "${label}"`);
+            for (const label of note.labels) fm.push(`  - ${yamlQuote(label)}`);
         }
         if (note.pinned) fm.push("pinned: true");
         if (note.archived) fm.push("archived: true");
@@ -641,16 +785,11 @@ export class SyncService {
     }
 
     private sanitizeFilename(title: string): string {
-        return title
-            .replace(/[\\/:*?"<>|]/g, "-")
-            .replace(/\s+/g, " ")
-            .trim()
-            .slice(0, 100) || "Untitled";
+        return sanitizeFilename(title);
     }
 
     private extractFrontmatterValue(content: string, key: string): string | null {
-        const match = content.match(new RegExp(`^${key}:\\s*"?([^"\\n]+)"?`, "m"));
-        return match ? match[1].trim() : null;
+        return extractFrontmatterValue(content, key);
     }
 
     private async ensureFolder(path: string): Promise<void> {
