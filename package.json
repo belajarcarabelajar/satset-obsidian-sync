@@ -8,8 +8,8 @@
         "dev": "esbuild src/main.ts --bundle --external:obsidian --outfile=main.js --format=cjs --platform=node --target=es2018 --watch"
     },
     "devDependencies": {
-        "@types/node": "^22.0.0",
-        "esbuild": "^0.20.0",
+        "@types/node": "^26.6.6",
+        "esbuild": "^0.28.2",
         "obsidian": "latest",
         "typescript": "^5.5.0"
     }
